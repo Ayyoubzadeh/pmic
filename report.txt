@@ -1,0 +1,171 @@
+[INFO] XGBoost available.
+[INFO] LightGBM available.
+============================================================
+  pMIC Prediction Pipeline v2
+  Active threshold : pMIC ≥ 5.0
+  Train/Test split : 80/20
+  CV folds         : 5
+  Corr. filter     : |r| > 0.95
+  Optuna trials    : disabled
+============================================================
+[Data] Loaded 35948 rows from Smiles.xlsx
+[Data] 35948 molecules  |  pMIC 1.78–9.03
+
+[Features] Morgan(r=2,2048) + MACCS(167) + AtomPair(2048) + RDKit(2048) + 216 descriptors …
+[Features] Matrix: (35948, 6527)  |  invalid SMILES dropped: 0
+
+════════════════════════════════════════════════════════════
+  REGRESSION  (predict pMIC)
+════════════════════════════════════════════════════════════
+  Train: 28758  |  Test: 7190
+  pMIC train — mean=5.19  std=1.03  range=[1.78, 9.03]
+  After variance filter   : 4887 features
+  Correlation filter (|r|>0.95)… → 4827 features
+  Mutual information top-1000… → 1000 features
+
+  Model                   CV R²   Test R²    CV RMSE  Test RMSE
+  -------------------- --------  --------  ---------  ---------
+  RandomForest           0.6338    0.6518     0.6255     0.6176
+  ExtraTrees             0.6461    0.6608     0.6149     0.6095
+  HistGradBoost          0.6146    0.6270     0.6416     0.6392
+  Ridge                  0.4495    0.4570     0.7668     0.7712
+  LinearSVR              0.4149    0.4214     0.7906     0.7961
+  XGBoost                0.6231    0.6342     0.6345     0.6330
+  LightGBM               0.6473    0.6620     0.6138     0.6085
+
+  Building Stacking (LightGBM + ExtraTrees + RandomForest) → Ridge …
+  Stacking               0.6528    0.6671     0.6090     0.6038
+
+  Best model (CV): Stacking  |  SHAP model: LightGBM
+
+════════════════════════════════════════════════════════════
+  Regression Metrics — Stacking (best by CV R²)
+════════════════════════════════════════════════════════════
+               R²     RMSE      MAE
+Train      0.8073   0.4538   0.2994
+CV (OOF)   0.6528   0.6090   0.4366
+Test       0.6671   0.6038   0.4314
+════════════════════════════════════════════════════════════
+[0/13] Model comparison
+  [saved] reg_00_model_comparison.png
+[1/13] MIC / pMIC distribution
+  [saved] reg_01_distribution.png
+[2/13] Predicted vs Experimental
+  [saved] reg_02_pred_vs_exp.png
+[3/13] Residual plot
+  [saved] reg_03_residuals.png
+[4/13] Error distribution
+  [saved] reg_04_error_distribution.png
+[5/13] Metrics summary bar chart
+  [saved] reg_05_metrics_summary.png
+[6/13] Cross-validation performance (per fold)
+  [saved] reg_06_cv_performance.png
+[7/13] PCA / t-SNE / UMAP
+  [saved] reg_07_embedding.png
+[8/13] SHAP summary plot
+  [saved] reg_08_shap_summary.png
+[9/13] Feature importance bar plot
+  [saved] reg_09_feature_importance.png
+[10/13] SHAP dependence plot
+  [saved] reg_10_shap_dependence.png
+[11/13] Y-randomization (50 permutations) …
+  [saved] reg_11_y_randomization.png
+[12/13] Williams plot (Applicability Domain)
+  [saved] reg_12_williams_plot.png
+[13/13] RMSE comparison — all models
+  [saved] reg_13_rmse_comparison.png
+
+════════════════════════════════════════════════════════════
+  CLASSIFICATION  (Active: pMIC ≥ 5.0  |  Inactive: pMIC < 5.0)
+════════════════════════════════════════════════════════════
+  Gray-zone excluded : 10439 compounds (|pMIC−5.0| < 0.5)
+  Train: 18319 (active=10482, 57.2%) | Test: 7190 (active=3822, 53.2%)
+  After variance filter   : 4831 features
+  Correlation filter (|r|>0.95)… → 4765 features
+  Mutual information top-300… → 300 features
+
+  Model                  CV AUC  Test AUC     CV F1   Test F1
+  -------------------- --------  --------  --------  --------
+  LinearSVM              0.8605    0.7739    0.7976    0.7024
+  LogisticReg            0.8593    0.7740    0.8052    0.7126
+  RandomForest           0.9568    0.8778    0.9194    0.8140
+  ExtraTrees             0.9593    0.8794    0.9218    0.8172
+  HistGradBoost          0.9513    0.8664    0.9124    0.8050
+  XGBoost                0.9541    0.8701    0.9153    0.8074
+  LightGBM               0.9602    0.8796    0.9179    0.8094
+
+  Building Stacking (LightGBM + ExtraTrees + RandomForest) → LogisticRegression …
+  Stacking               0.9606    0.8814    0.9220    0.8145
+
+════════════════════════════════════════════════════════════
+  Classification Metrics — Stacking (threshold=0.47)
+════════════════════════════════════════════════════════════
+          Accuracy  Bal. Acc.  ROC-AUC       F1  Precision  Recall/Sens.  Specificity      MCC
+Train       0.9683     0.9666   0.9934   0.9725     0.9663        0.9788       0.9543   0.9353
+CV (OOF)    0.9112     0.9101   0.9606   0.9220     0.9264        0.9177       0.9025   0.8189
+Test        0.8051     0.8052   0.8814   0.8145     0.8246        0.8046       0.8058   0.6096
+════════════════════════════════════════════════════════════
+  Best model (CV AUC): Stacking  |  SHAP model: LightGBM
+[0/12] Model comparison
+  [saved] cls_00_model_comparison.png
+[1/12] Active vs Inactive distribution
+  [saved] cls_01_class_distribution.png
+[2/12] ROC curve
+  [saved] cls_02_roc_curve.png
+[3/12] Precision–Recall curve
+  [saved] cls_03_pr_curve.png
+[4/12] Confusion matrix
+  [saved] cls_04_confusion_matrix.png
+[5/12] Metrics summary bar chart
+  [saved] cls_05_metrics_summary.png
+[6/12] Cross-validation performance (per fold)
+  [saved] cls_06_cv_performance.png
+[7/12] PCA / t-SNE / UMAP
+  [saved] cls_07_embedding.png
+[8/12] SHAP summary plot
+  [saved] cls_08_shap_summary.png
+[9/12] Feature importance bar plot
+  [saved] cls_09_feature_importance.png
+[10/12] SHAP dependence plot
+  [saved] cls_10_shap_dependence.png
+[11/12] Y-randomization (50 permutations) …
+  [saved] cls_11_y_randomization.png
+[12/12] F1 comparison — all models
+  [saved] cls_12_f1_comparison.png
+
+Classification Report — Train:
+              precision    recall  f1-score   support
+
+    Inactive       0.97      0.95      0.96      7837
+      Active       0.97      0.98      0.97     10482
+
+    accuracy                           0.97     18319
+   macro avg       0.97      0.97      0.97     18319
+weighted avg       0.97      0.97      0.97     18319
+
+
+Classification Report — CV:
+              precision    recall  f1-score   support
+
+    Inactive       0.89      0.90      0.90      7837
+      Active       0.93      0.92      0.92     10482
+
+    accuracy                           0.91     18319
+   macro avg       0.91      0.91      0.91     18319
+weighted avg       0.91      0.91      0.91     18319
+
+
+Classification Report — Test:
+              precision    recall  f1-score   support
+
+    Inactive       0.78      0.81      0.79      3368
+      Active       0.82      0.80      0.81      3822
+
+    accuracy                           0.81      7190
+   macro avg       0.80      0.81      0.80      7190
+weighted avg       0.81      0.81      0.81      7190
+
+
+============================================================
+  27 plots saved → C:\Files\Projects\maghsoodlu\plots
+============================================================

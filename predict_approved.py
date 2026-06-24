@@ -18,8 +18,9 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
-# reuse feature extraction from the training pipeline
+# reuse feature extraction and transformer class from the training pipeline
 from pmic_prediction import smiles_to_features, PMIC_THRESHOLD
+from pmic_utils import FeatureTransformer  # noqa: F401 — needed for joblib unpickling
 
 INPUT_FILE  = sys.argv[1] if len(sys.argv) > 1 else "approved.xlsx"
 OUTPUT_FILE = sys.argv[2] if len(sys.argv) > 2 else "predictions_approved.xlsx"

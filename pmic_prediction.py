@@ -19,6 +19,7 @@ Install:
 
 import sys
 import warnings
+import joblib
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -205,6 +206,20 @@ def smiles_to_features(smiles_list, n_bits=2048, radius=2, ap_bits=2048):
 # ══════════════════════════════════════════════════════════════════════════════
 # FEATURE SELECTION  (variance filter → correlation filter)
 # ══════════════════════════════════════════════════════════════════════════════
+class FeatureTransformer:
+    """Picklable wrapper around the fitted variance / correlation / MI selectors."""
+    def __init__(self, sel_vt, keep, sel_mi):
+        self.sel_vt = sel_vt
+        self.keep   = keep
+        self.sel_mi = sel_mi
+
+    def __call__(self, X):
+        out = self.sel_vt.transform(X).astype(np.float32)[:, self.keep]
+        if self.sel_mi is not None:
+            out = self.sel_mi.transform(out)
+        return out
+
+
 def _correlation_keep_idx(X_tr, threshold):
     """Greedy removal: for each pair |r| > threshold, drop the second feature."""
     n_samples = min(5000, X_tr.shape[0])
@@ -250,13 +265,7 @@ def select_features(X_tr, X_te, feat_names, y_tr=None, task="cls", var_thresh=0.
         names = [names[i] for i in sel_mi.get_support(indices=True)]
         print(f"→ {len(names)} features")
 
-    def transform_fn(X):
-        out = sel_vt.transform(X).astype(np.float32)[:, keep]
-        if sel_mi is not None:
-            out = sel_mi.transform(out)
-        return out
-
-    return Xtr, Xte, names, transform_fn
+    return Xtr, Xte, names, FeatureTransformer(sel_vt, keep, sel_mi)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -911,7 +920,7 @@ def run_regression(X, y, feat_names):
         "−RMSE (higher = better)", "Regression — RMSE Comparison (all models)",
         "reg_13_rmse_comparison")
 
-    return trained[best_name]
+    return trained[best_name], transform_fn
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1157,6 +1166,7 @@ def run_classification(X, y_pmic, feat_names):
     print("[10/12] SHAP dependence plot")
     plot_shap_dependence(sv, X_s, feat_names_f, "Classification", "cls_10_shap_dependence", top_n=2)
 
+
     # ── [11] Y-randomization ──────────────────────────────────────────────────
     print("[11/12] Y-randomization (50 permutations) …")
     _true_auc = float(
@@ -1180,7 +1190,7 @@ def run_classification(X, y_pmic, feat_names):
         print(f"\nClassification Report — {name}:")
         print(classification_report(yt, yp, target_names=["Inactive", "Active"]))
 
-    return best_model
+    return best_model, transform_fn
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1206,8 +1216,13 @@ def main():
 
     np.random.seed(RANDOM_STATE)
 
-    run_regression(X, y, feat_names)
-    run_classification(X, y, feat_names)
+    best_reg_model, reg_transform_fn = run_regression(X, y, feat_names)
+    best_cls_model, cls_transform_fn = run_classification(X, y, feat_names)
+
+    joblib.dump({"model": best_reg_model, "transform_fn": reg_transform_fn}, "best_reg_model.joblib")
+    print(f"  [saved] best_reg_model.joblib")
+    joblib.dump({"model": best_cls_model, "transform_fn": cls_transform_fn}, "best_cls_model.joblib")
+    print(f"  [saved] best_cls_model.joblib")
 
     n_plots = len(list(OUTPUT_DIR.glob("*.png")))
     print(f"\n{'='*60}")

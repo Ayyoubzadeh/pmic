@@ -113,6 +113,8 @@ GRAY_ZONE_MARGIN = 0.5    # exclude compounds with |pMIC−threshold| < margin f
 N_OPTUNA_TRIALS  = 0      # 0 = disabled; 30–50 recommended if time allows
 OUTPUT_DIR       = Path("plots")
 OUTPUT_DIR.mkdir(exist_ok=True)
+PREPROCESSED_DATA = "preprocessed_data.xlsx"
+FEATURES_LIST     = "generated_features.txt"
 
 plt.rcParams.update({
     "figure.dpi": 120, "font.size": 11,
@@ -151,11 +153,35 @@ def load_data(filepath):
     return df.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
 
 
+def save_preprocessed_data(df, valid_idx, path=PREPROCESSED_DATA):
+    """Write cleaned compounds (valid SMILES, pMIC, Active label) to Excel."""
+    out = df.iloc[valid_idx].copy().reset_index(drop=True)
+    out["Active"] = (out["pMIC"] >= PMIC_THRESHOLD).astype(int)
+    out.to_excel(path, index=False)
+    print(f"  [saved] {path}  ({len(out)} rows × {len(out.columns)} columns)")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # FEATURE EXTRACTION  (Morgan + MACCS + Atom-Pair + RDKit-path + Descriptors)
 # ══════════════════════════════════════════════════════════════════════════════
 _ALL_DESC_NAMES = [d[0] for d in Descriptors.descList if d[0] != "Ipc"]
 _CALC = MoleculeDescriptors.MolecularDescriptorCalculator(_ALL_DESC_NAMES)
+
+
+def build_feature_names(n_bits=2048, ap_bits=2048):
+    return (
+        [f"morgan_{i}"     for i in range(n_bits)]
+        + [f"maccs_{i}"    for i in range(167)]
+        + [f"atompair_{i}" for i in range(ap_bits)]
+        + [f"rdkit_{i}"    for i in range(n_bits)]
+        + _ALL_DESC_NAMES
+    )
+
+
+def save_feature_list(feat_names, path=FEATURES_LIST):
+    """Write the full generated feature name list (one name per line)."""
+    Path(path).write_text("\n".join(feat_names) + "\n", encoding="utf-8")
+    print(f"  [saved] {path}  ({len(feat_names)} features)")
 
 
 def smiles_to_features(smiles_list, n_bits=2048, radius=2, ap_bits=2048):
@@ -193,13 +219,7 @@ def smiles_to_features(smiles_list, n_bits=2048, radius=2, ap_bits=2048):
         np.array(fps_morgan), np.array(fps_maccs),
         np.array(fps_ap), np.array(fps_rdk), X_desc,
     ])
-    feat_names = (
-        [f"morgan_{i}"   for i in range(n_bits)]
-        + [f"maccs_{i}"  for i in range(167)]
-        + [f"atompair_{i}" for i in range(ap_bits)]
-        + [f"rdkit_{i}"  for i in range(n_bits)]
-        + _ALL_DESC_NAMES
-    )
+    feat_names = build_feature_names(n_bits, ap_bits)
     return X, valid_idx, feat_names
 
 
@@ -1198,10 +1218,15 @@ def main():
     df = load_data(DATA)
     print(f"[Data] {len(df)} molecules  |  pMIC {df['pMIC'].min():.2f}–{df['pMIC'].max():.2f}")
 
+    save_feature_list(build_feature_names())
+
     print(f"\n[Features] Morgan(r=2,2048) + MACCS(167) + AtomPair(2048) + RDKit(2048) + {len(_ALL_DESC_NAMES)} descriptors …")
     X, valid_idx, feat_names = smiles_to_features(df["SMILES"].tolist())
     y = df["pMIC"].iloc[valid_idx].values
     print(f"[Features] Matrix: {X.shape}  |  invalid SMILES dropped: {len(df)-len(valid_idx)}")
+
+    print(f"\n[Data] Saving preprocessed data → {PREPROCESSED_DATA}")
+    save_preprocessed_data(df, valid_idx)
 
     np.random.seed(RANDOM_STATE)
 
@@ -1220,4 +1245,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] in ("--features-only", "--features-list"):
+        save_feature_list(build_feature_names())
+    else:
+        main()

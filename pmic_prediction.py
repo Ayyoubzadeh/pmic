@@ -191,27 +191,37 @@ def smiles_to_features(smiles_list, n_bits=2048, radius=2, ap_bits=2048):
 
     for i, smi in enumerate(smiles_list):
         mol = Chem.MolFromSmiles(str(smi))
-        if mol is None:
+        # Skip unparseable / empty / H-only structures (SPS descriptor ÷0 on 0 heavy atoms)
+        if mol is None or mol.GetNumHeavyAtoms() == 0:
             continue
 
-        arr = np.zeros(n_bits, dtype=np.float32)
-        DataStructs.ConvertToNumpyArray(_mgen.GetFingerprint(mol), arr)
+        try:
+            arr = np.zeros(n_bits, dtype=np.float32)
+            DataStructs.ConvertToNumpyArray(_mgen.GetFingerprint(mol), arr)
+
+            maccs_arr = np.zeros(167, dtype=np.float32)
+            DataStructs.ConvertToNumpyArray(MACCSkeys.GenMACCSKeys(mol), maccs_arr)
+
+            ap_arr = np.zeros(ap_bits, dtype=np.float32)
+            DataStructs.ConvertToNumpyArray(_apgen.GetFingerprint(mol), ap_arr)
+
+            rdk_arr = np.zeros(n_bits, dtype=np.float32)
+            DataStructs.ConvertToNumpyArray(Chem.RDKFingerprint(mol, fpSize=n_bits), rdk_arr)
+
+            desc = np.array(_CALC.CalcDescriptors(mol), dtype=np.float32)
+        except Exception:
+            continue
+
         fps_morgan.append(arr)
-
-        maccs_arr = np.zeros(167, dtype=np.float32)
-        DataStructs.ConvertToNumpyArray(MACCSkeys.GenMACCSKeys(mol), maccs_arr)
         fps_maccs.append(maccs_arr)
-
-        ap_arr = np.zeros(ap_bits, dtype=np.float32)
-        DataStructs.ConvertToNumpyArray(_apgen.GetFingerprint(mol), ap_arr)
         fps_ap.append(ap_arr)
-
-        rdk_arr = np.zeros(n_bits, dtype=np.float32)
-        DataStructs.ConvertToNumpyArray(Chem.RDKFingerprint(mol, fpSize=n_bits), rdk_arr)
         fps_rdk.append(rdk_arr)
-
-        descs.append(np.array(_CALC.CalcDescriptors(mol), dtype=np.float32))
+        descs.append(desc)
         valid_idx.append(i)
+
+    if not valid_idx:
+        feat_names = build_feature_names(n_bits, ap_bits)
+        return np.empty((0, len(feat_names)), dtype=np.float32), valid_idx, feat_names
 
     X_desc = np.nan_to_num(np.array(descs), nan=0.0, posinf=0.0, neginf=0.0)
     np.clip(X_desc, -1e6, 1e6, out=X_desc)

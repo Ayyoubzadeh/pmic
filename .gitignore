@@ -1,2 +1,20 @@
+# Existing data dumps
 coconut_csv-07-2026.xlsx
 predictions_coconut.csv
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Trained models (tens to hundreds of MB)
+*.joblib
+
+# Archives
+*.rar
+*.zip
+*.7z
+
+# Large datasets
+coconut_csv-07-2026_pmic.csv
+other/*.xlsx

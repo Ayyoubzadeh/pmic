@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-pMIC Prediction Pipeline v2
-Multi-model ensemble with stacking, enhanced features, and optional Bayesian tuning.
+pMIC Prediction Pipeline v3
+Multi-model ensemble with Butina (Tanimoto) cluster split, stacking, SHAP,
+threshold comparison (pMIC 5/6/7), FP highlighting, and external validation.
 
-New vs v1:
-  • Atom-pair + RDKit path fingerprints (richer structural encoding)
-  • Pearson correlation filter (removes redundant features)
-  • ExtraTrees, HistGradientBoosting, XGBoost (opt.), LightGBM (opt.)
-  • Stacking ensemble (top-3 base models → Ridge / LogisticRegression)
-  • Optimal decision threshold for classification
-  • Optuna hyperparameter tuning (set N_OPTUNA_TRIALS > 0 to enable)
-  • Model comparison plot for all candidates
+New vs v2:
+  • Butina cluster split (Tanimoto) + GroupKFold by cluster (no random split)
+  • Auto-select classification cutoff among pMIC 5 / 6 / 7 (+ 3-class report)
+  • Dataset_role labels: Train/CV-fold-k vs Test in preprocessed_data.xlsx
+  • Highlight top Morgan/MACCS SHAP bits on top-5 test mols + mapping drugs
+  • External validation (Cleaned_External_Validation.xlsx)
+  • Auto-screen approved / 4FDN / CyanoMetDB for repurposing candidates
 
 Install:
   pip install rdkit scikit-learn shap seaborn matplotlib pandas numpy umap-learn
@@ -43,7 +43,7 @@ from sklearn.linear_model import Ridge, LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import (
-    KFold, StratifiedKFold,
+    KFold, StratifiedKFold, GroupKFold,
     cross_val_score, cross_val_predict, train_test_split,
 )
 from sklearn.decomposition import PCA
@@ -111,10 +111,19 @@ MI_TOP_K_REG     = 1000   # top-K features by MI for regression (tree models nee
 MI_TOP_K_CLS     = 300    # top-K features by MI for classification
 GRAY_ZONE_MARGIN = 0.5    # exclude compounds with |pMIC−threshold| < margin from cls training
 N_OPTUNA_TRIALS  = 0      # 0 = disabled; 30–50 recommended if time allows
+BUTINA_DIST_CUTOFF = 0.4  # Tanimoto distance cutoff for Butina clustering (sim ≥ 0.6)
 OUTPUT_DIR       = Path("plots")
 OUTPUT_DIR.mkdir(exist_ok=True)
 PREPROCESSED_DATA = "preprocessed_data.xlsx"
 FEATURES_LIST     = "generated_features.txt"
+THRESHOLD_COMPARE = (5.5, 6.0)  # 7 excluded: too sparse; external often has no actives
+MAPPING_XLSX      = "SMILES for mapping.xlsx"
+EXTERNAL_XLSX     = "Cleaned_External_Validation.xlsx"
+REPURPOSE_FILES   = [
+    "approved.xlsx",
+    "4FDN-Natural-products-dock.xlsx",
+    "CyanoMetDB_V03_2024.xlsx",
+]
 
 plt.rcParams.update({
     "figure.dpi": 120, "font.size": 11,
@@ -153,10 +162,27 @@ def load_data(filepath):
     return df.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
 
 
-def save_preprocessed_data(df, valid_idx, path=PREPROCESSED_DATA):
-    """Write cleaned compounds (valid SMILES, pMIC, Active label) to Excel."""
+def save_preprocessed_data(df, valid_idx, path=PREPROCESSED_DATA,
+                           split_labels=None, cv_folds=None, cluster_ids=None):
+    """Write cleaned compounds with Active label and Train/Test/CV role."""
     out = df.iloc[valid_idx].copy().reset_index(drop=True)
     out["Active"] = (out["pMIC"] >= PMIC_THRESHOLD).astype(int)
+    if cluster_ids is not None:
+        out["Butina_cluster"] = cluster_ids
+    if split_labels is not None:
+        out["Split"] = split_labels  # Train / Test
+    if cv_folds is not None:
+        out["CV_fold"] = cv_folds    # fold where molecule was OOF (−1 = Test)
+        # human-readable role: Test | CV-fold-k (train molecules participate in CV)
+        roles = []
+        for sp, fold in zip(out["Split"], out["CV_fold"]):
+            if sp == "Test":
+                roles.append("Test")
+            elif fold is not None and int(fold) >= 0:
+                roles.append(f"Train/CV-fold-{int(fold)}")
+            else:
+                roles.append("Train")
+        out["Dataset_role"] = roles
     out.to_excel(path, index=False)
     print(f"  [saved] {path}  ({len(out)} rows × {len(out.columns)} columns)")
 
@@ -237,6 +263,11 @@ def smiles_to_features(smiles_list, n_bits=2048, radius=2, ap_bits=2048):
 # FEATURE SELECTION  (variance filter → correlation filter)
 # ══════════════════════════════════════════════════════════════════════════════
 from pmic_utils import FeatureTransformer
+from pmic_extras import (
+    butina_clusters, cluster_train_test_split, make_group_cv, cv_fold_labels,
+    compare_pmic_thresholds, try_three_class,
+    highlight_top_test_and_mapping, run_external_validation,
+)
 
 
 def _correlation_keep_idx(X_tr, threshold):
@@ -685,16 +716,73 @@ def optimal_threshold(y_true, y_proba):
     return float(thresholds[np.argmax(scores)])
 
 
+def plot_williams_classification(X_tr_f, X_te_f, y_tr, y_te, y_tr_proba, y_te_proba,
+                                 fname="cls_13_williams_plot", title_suffix=""):
+    """
+    Williams plot for classification applicability domain.
+    Leverage from PCA of the selected feature space; standardised residual of
+    probability: (y_true − P_active) / σ_train.
+    """
+    n_comp = min(50, X_tr_f.shape[0] - 1, X_tr_f.shape[1])
+    scaler = StandardScaler().fit(X_tr_f)
+    pca = PCA(n_components=n_comp, random_state=RANDOM_STATE).fit(scaler.transform(X_tr_f))
+    Z_tr = pca.transform(scaler.transform(X_tr_f))
+    Z_te = pca.transform(scaler.transform(X_te_f))
+    XtXinv = np.linalg.pinv(Z_tr.T @ Z_tr)
+    h_tr = np.einsum("ij,jk,ik->i", Z_tr, XtXinv, Z_tr)
+    h_te = np.einsum("ij,jk,ik->i", Z_te, XtXinv, Z_te)
+    h_star = 3.0 * (n_comp + 1) / len(X_tr_f)
+
+    res_tr = y_tr.astype(float) - y_tr_proba
+    res_te = y_te.astype(float) - y_te_proba
+    sigma = float(res_tr.std()) + 1e-12
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for h, res, name in [(h_tr, res_tr, "Train"), (h_te, res_te, "Test")]:
+        std_r = res / sigma
+        outlier = (h > h_star) | (np.abs(std_r) > 3)
+        s = SET_STYLE[name]
+        ax.scatter(h[~outlier], std_r[~outlier], s=30, alpha=0.7,
+                   color=s["color"], marker=s["marker"], edgecolors="none",
+                   label=f"{name} (in-AD: {int((~outlier).sum())})")
+        ax.scatter(h[outlier], std_r[outlier], s=50, alpha=0.9,
+                   color=s["color"], marker="X", edgecolors="black", lw=0.5,
+                   label=f"{name} outlier ({int(outlier.sum())})")
+    ax.axhline(3, color="crimson", linestyle="--", lw=1.5, label="±3σ")
+    ax.axhline(-3, color="crimson", linestyle="--", lw=1.5)
+    ax.axvline(h_star, color="darkorange", linestyle="--", lw=1.8,
+               label=f"h*={h_star:.3f}")
+    ax.set_xlabel("Leverage  h")
+    ax.set_ylabel("Standardised Residual  (y − P_active) / σ")
+    ttl = "Williams Plot — Classification AD"
+    if title_suffix:
+        ttl = f"{ttl} — {title_suffix}"
+    ax.set_title(ttl, fontweight="bold")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    save_fig(fig, fname)
+    return {
+        "h_star": h_star,
+        "n_comp": n_comp,
+        "sigma": sigma,
+        "train_in_ad": int(((h_tr <= h_star) & (np.abs(res_tr / sigma) <= 3)).sum()),
+        "train_outlier": int(((h_tr > h_star) | (np.abs(res_tr / sigma) > 3)).sum()),
+        "test_in_ad": int(((h_te <= h_star) & (np.abs(res_te / sigma) <= 3)).sum()),
+        "test_outlier": int(((h_te > h_star) | (np.abs(res_te / sigma) > 3)).sum()),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # REGRESSION PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
-def run_regression(X, y, feat_names):
+def run_regression(X, y, feat_names, tr_idx, te_idx, groups_tr):
     print("\n" + "═" * 60)
-    print("  REGRESSION  (predict pMIC)")
+    print("  REGRESSION  (predict pMIC)  — Butina cluster split")
     print("═" * 60)
 
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    X_tr, X_te = X[tr_idx], X[te_idx]
+    y_tr, y_te = y[tr_idx], y[te_idx]
     print(f"  Train: {len(y_tr)}  |  Test: {len(y_te)}")
     print(f"  pMIC train — mean={y_tr.mean():.2f}  std={y_tr.std():.2f}  "
           f"range=[{y_tr.min():.2f}, {y_tr.max():.2f}]")
@@ -703,7 +791,7 @@ def run_regression(X, y, feat_names):
         X_tr, X_te, feat_names, y_tr=y_tr, task="reg")
 
     models = build_reg_models(len(y_tr))
-    cv     = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    cv_splits = make_group_cv(groups_tr, n_folds=N_FOLDS)
 
     # ── compare all base models ───────────────────────────────────────────────
     print(f"\n  {'Model':<20} {'CV R²':>8}  {'Test R²':>8}  {'CV RMSE':>9}  {'Test RMSE':>9}")
@@ -715,7 +803,7 @@ def run_regression(X, y, feat_names):
     trained  = {}
 
     for name, model in models.items():
-        cv_p = cross_val_predict(model, X_tr_f, y_tr, cv=cv, n_jobs=-1)
+        cv_p = cross_val_predict(model, X_tr_f, y_tr, cv=cv_splits, n_jobs=-1)
         model.fit(X_tr_f, y_tr)
         te_p = model.predict(X_te_f)
         cv_preds[name] = cv_p; te_preds[name] = te_p; trained[name] = model
@@ -730,7 +818,7 @@ def run_regression(X, y, feat_names):
     if N_OPTUNA_TRIALS > 0 and HAS_OPTUNA:
         best_base = max(cv_r2, key=cv_r2.get)
         print(f"\n  [Optuna] Tuning {best_base} ({N_OPTUNA_TRIALS} trials)…")
-        best_params = tune_reg_optuna(best_base, X_tr_f, y_tr, N_OPTUNA_TRIALS, cv)
+        best_params = tune_reg_optuna(best_base, X_tr_f, y_tr, N_OPTUNA_TRIALS, cv_splits)
         print(f"  Best params: {best_params}")
 
     # ── stacking: top-3 tree models ───────────────────────────────────────────
@@ -740,14 +828,16 @@ def run_regression(X, y, feat_names):
     stacking = StackingRegressor(
         estimators=[(n, build_reg_models(len(y_tr))[n]) for n in top3],
         final_estimator=Ridge(alpha=1.0),
-        cv=N_FOLDS, n_jobs=1,
+        cv=cv_splits, n_jobs=1,
     )
     stacking.fit(X_tr_f, y_tr)
+    # Inner CV must be an integer/KFold: precomputed splits are NOT valid partitions
+    # of the subset seen inside outer cross_val_predict.
     stk_cv_p = cross_val_predict(
         StackingRegressor(
             estimators=[(n, build_reg_models(len(y_tr))[n]) for n in top3],
-            final_estimator=Ridge(alpha=1.0), cv=N_FOLDS, n_jobs=1),
-        X_tr_f, y_tr, cv=cv, n_jobs=1)
+            final_estimator=Ridge(alpha=1.0), cv=min(3, N_FOLDS), n_jobs=1),
+        X_tr_f, y_tr, cv=cv_splits, n_jobs=1)
     stk_te_p = stacking.predict(X_te_f)
 
     cv_r2["Stacking"]   = r2_score(y_tr, stk_cv_p)
@@ -858,10 +948,10 @@ def run_regression(X, y, feat_names):
                if k != "estimators"} if hasattr(shap_model, "get_params") else {}
     try:
         _cls = shap_model.__class__
-        cv_r2_folds   = cross_val_score(_cls(**_params), X_tr_f, y_tr, cv=cv, scoring="r2",    n_jobs=-1)
-        cv_rmse_folds = np.sqrt(-cross_val_score(_cls(**_params), X_tr_f, y_tr, cv=cv,
+        cv_r2_folds   = cross_val_score(_cls(**_params), X_tr_f, y_tr, cv=cv_splits, scoring="r2",    n_jobs=-1)
+        cv_rmse_folds = np.sqrt(-cross_val_score(_cls(**_params), X_tr_f, y_tr, cv=cv_splits,
                                                   scoring="neg_mean_squared_error", n_jobs=-1))
-        cv_mae_folds  = -cross_val_score(_cls(**_params), X_tr_f, y_tr, cv=cv,
+        cv_mae_folds  = -cross_val_score(_cls(**_params), X_tr_f, y_tr, cv=cv_splits,
                                           scoring="neg_mean_absolute_error", n_jobs=-1)
         plot_cv_box({"R²": cv_r2_folds, "RMSE": cv_rmse_folds, "MAE": cv_mae_folds},
                     f"CV Performance per Fold — {shap_name}", "reg_06_cv_performance", ylim=None)
@@ -871,7 +961,8 @@ def run_regression(X, y, feat_names):
     # ── [07] PCA / t-SNE / UMAP ───────────────────────────────────────────────
     print("[7/13] PCA / t-SNE / UMAP")
     X_all_f = transform_fn(X)
-    train_mask = np.concatenate([np.ones(len(y_tr), bool), np.zeros(len(y_te), bool)])
+    train_mask = np.zeros(len(X), bool)
+    train_mask[tr_idx] = True
     plot_embedding(X_all_f, y, "reg_07", cls_mode=False, train_mask=train_mask)
 
     # ── SHAP (tree model) ─────────────────────────────────────────────────────
@@ -892,7 +983,7 @@ def run_regression(X, y, feat_names):
     print("[11/13] Y-randomization (50 permutations) …")
     _true_cv_r2 = float(
         cross_val_score(RandomForestRegressor(n_estimators=50, random_state=RANDOM_STATE, n_jobs=-1),
-                        X_tr_f, y_tr, cv=cv, scoring="r2").mean())
+                        X_tr_f, y_tr, cv=cv_splits, scoring="r2").mean())
     plot_y_randomization(
         RandomForestRegressor,
         dict(n_estimators=50, random_state=RANDOM_STATE, n_jobs=-1),
@@ -939,31 +1030,36 @@ def run_regression(X, y, feat_names):
         "−RMSE (higher = better)", "Regression — RMSE Comparison (all models)",
         "reg_13_rmse_comparison")
 
-    return trained[best_name], transform_fn
+    reg_info = {
+        "y_te_pred": y_te_pred,
+        "y_te": y_te,
+        "shap_values": sv,
+        "feat_names_f": feat_names_f,
+        "cv_fold_tr": cv_fold_labels(len(y_tr), cv_splits),
+    }
+    return trained[best_name], transform_fn, reg_info
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLASSIFICATION PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
-def run_classification(X, y_pmic, feat_names):
+def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr):
     print("\n" + "═" * 60)
     print(f"  CLASSIFICATION  (Active: pMIC ≥ {PMIC_THRESHOLD}  |  Inactive: pMIC < {PMIC_THRESHOLD})")
     print("═" * 60)
 
     y_bin = (y_pmic >= PMIC_THRESHOLD).astype(int)
-
-    # Stratified split on the full set so test covers all compounds
-    all_idx = np.arange(len(X))
-    tr_idx, te_idx = train_test_split(
-        all_idx, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y_bin)
     X_te, y_te = X[te_idx], y_bin[te_idx]
     y_pmic_tr_all = y_pmic[tr_idx]
+    groups_clear = groups_tr
 
     # Gray-zone exclusion: remove ambiguous boundary compounds from training
     if GRAY_ZONE_MARGIN > 0:
         clear = np.abs(y_pmic_tr_all - PMIC_THRESHOLD) >= GRAY_ZONE_MARGIN
         X_tr  = X[tr_idx][clear]
         y_tr  = y_bin[tr_idx][clear]
+        groups_clear = groups_tr[clear]
         gray_n = (~clear).sum()
         print(f"  Gray-zone excluded : {gray_n} compounds "
               f"(|pMIC−{PMIC_THRESHOLD}| < {GRAY_ZONE_MARGIN})")
@@ -982,7 +1078,7 @@ def run_classification(X, y_pmic, feat_names):
         X_tr, X_te, feat_names, y_tr=y_tr, task="cls")
 
     models = build_cls_models(len(y_tr))
-    cv     = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    cv_splits = make_group_cv(groups_clear, n_folds=N_FOLDS)
 
     print(f"\n  {'Model':<20} {'CV AUC':>8}  {'Test AUC':>8}  {'CV F1':>8}  {'Test F1':>8}")
     print(f"  {'-'*20} {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
@@ -993,7 +1089,7 @@ def run_classification(X, y_pmic, feat_names):
     trained   = {}
 
     for name, model in models.items():
-        cv_p = cross_val_predict(model, X_tr_f, y_tr, cv=cv, method="predict_proba", n_jobs=-1)[:, 1]
+        cv_p = cross_val_predict(model, X_tr_f, y_tr, cv=cv_splits, method="predict_proba", n_jobs=-1)[:, 1]
         model.fit(X_tr_f, y_tr)
         te_p = model.predict_proba(X_te_f)[:, 1]
         cv_probas[name] = cv_p; te_probas[name] = te_p; trained[name] = model
@@ -1014,7 +1110,7 @@ def run_classification(X, y_pmic, feat_names):
     if N_OPTUNA_TRIALS > 0 and HAS_OPTUNA:
         best_base = max(cv_auc, key=cv_auc.get)
         print(f"\n  [Optuna] Tuning {best_base} ({N_OPTUNA_TRIALS} trials)…")
-        best_params = tune_cls_optuna(best_base, X_tr_f, y_tr, N_OPTUNA_TRIALS, cv)
+        best_params = tune_cls_optuna(best_base, X_tr_f, y_tr, N_OPTUNA_TRIALS, cv_splits)
         print(f"  Best params: {best_params}")
 
     # ── stacking ──────────────────────────────────────────────────────────────
@@ -1025,7 +1121,7 @@ def run_classification(X, y_pmic, feat_names):
         estimators=[(n, build_cls_models(len(y_tr))[n]) for n in top3],
         final_estimator=LogisticRegression(max_iter=1000, C=0.5, class_weight="balanced",
                                            random_state=RANDOM_STATE),
-        cv=N_FOLDS, n_jobs=1,
+        cv=cv_splits, n_jobs=1,
     )
     stacking.fit(X_tr_f, y_tr)
     stk_cv_p = cross_val_predict(
@@ -1033,8 +1129,8 @@ def run_classification(X, y_pmic, feat_names):
             estimators=[(n, build_cls_models(len(y_tr))[n]) for n in top3],
             final_estimator=LogisticRegression(max_iter=1000, C=0.5, class_weight="balanced",
                                                random_state=RANDOM_STATE),
-            cv=N_FOLDS, n_jobs=1),
-        X_tr_f, y_tr, cv=cv, method="predict_proba", n_jobs=1)[:, 1]
+            cv=min(3, N_FOLDS), n_jobs=1),
+        X_tr_f, y_tr, cv=cv_splits, method="predict_proba", n_jobs=1)[:, 1]
     stk_te_p = stacking.predict_proba(X_te_f)[:, 1]
 
     stk_thresh = optimal_threshold(y_tr, stk_cv_p)
@@ -1149,10 +1245,10 @@ def run_classification(X, y_pmic, feat_names):
     try:
         _cls = shap_model.__class__
         _p   = shap_model.get_params()
-        cv_acc_f  = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv, scoring="accuracy",          n_jobs=-1)
-        cv_auc_f  = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv, scoring="roc_auc",           n_jobs=-1)
-        cv_f1_f   = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv, scoring="f1",                n_jobs=-1)
-        cv_mcc_f  = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv, scoring="matthews_corrcoef", n_jobs=-1)
+        cv_acc_f  = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv_splits, scoring="accuracy",          n_jobs=-1)
+        cv_auc_f  = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv_splits, scoring="roc_auc",           n_jobs=-1)
+        cv_f1_f   = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv_splits, scoring="f1",                n_jobs=-1)
+        cv_mcc_f  = cross_val_score(_cls(**_p), X_tr_f, y_tr, cv=cv_splits, scoring="matthews_corrcoef", n_jobs=-1)
         plot_cv_box({"Accuracy": cv_acc_f, "ROC-AUC": cv_auc_f, "F1": cv_f1_f, "MCC": cv_mcc_f},
                     f"CV Performance per Fold — {shap_name}", "cls_06_cv_performance")
     except Exception:
@@ -1191,7 +1287,7 @@ def run_classification(X, y_pmic, feat_names):
     _true_auc = float(
         cross_val_score(RandomForestClassifier(n_estimators=50, class_weight="balanced",
                                                random_state=RANDOM_STATE, n_jobs=-1),
-                        X_tr_f, y_tr, cv=cv, scoring="roc_auc").mean())
+                        X_tr_f, y_tr, cv=cv_splits, scoring="roc_auc").mean())
     plot_y_randomization(
         RandomForestClassifier,
         dict(n_estimators=50, class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1),
@@ -1199,9 +1295,17 @@ def run_classification(X, y_pmic, feat_names):
         "ROC-AUC", "Y-Randomization — Classification", "cls_11_y_randomization")
 
     # ── [12] F1 comparison ────────────────────────────────────────────────────
-    print("[12/12] F1 comparison — all models")
+    print("[12/13] F1 comparison — all models")
     plot_model_comparison(cv_f1, test_f1, "F1 Score",
                           "Classification — F1 Comparison (all models)", "cls_12_f1_comparison")
+
+    # ── [13] Williams plot (Applicability Domain) ─────────────────────────────
+    print("[13/13] Williams plot (Classification Applicability Domain)")
+    plot_williams_classification(
+        X_tr_f, X_te_f, y_tr, y_te, y_tr_proba, y_te_proba,
+        fname="cls_13_williams_plot",
+        title_suffix=f"{best_name} (pMIC≥{PMIC_THRESHOLD})",
+    )
 
     for name, yt, yp in [("Train", y_tr, y_tr_pred),
                           ("CV",   y_tr, y_cv_pred),
@@ -1216,11 +1320,13 @@ def run_classification(X, y_pmic, feat_names):
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
+    global PMIC_THRESHOLD
+
     print("=" * 60)
-    print("  pMIC Prediction Pipeline v2")
-    print(f"  Active threshold : pMIC ≥ {PMIC_THRESHOLD}")
+    print("  pMIC Prediction Pipeline v3")
+    print(f"  Split            : Butina cluster (Tanimoto, cutoff={BUTINA_DIST_CUTOFF})")
     print(f"  Train/Test split : {int((1-TEST_SIZE)*100)}/{int(TEST_SIZE*100)}")
-    print(f"  CV folds         : {N_FOLDS}")
+    print(f"  CV folds         : {N_FOLDS} (GroupKFold by cluster)")
     print(f"  Corr. filter     : |r| > {CORR_THRESH}")
     print(f"  Optuna trials    : {N_OPTUNA_TRIALS if N_OPTUNA_TRIALS > 0 else 'disabled'}")
     print("=" * 60)
@@ -1230,27 +1336,120 @@ def main():
 
     save_feature_list(build_feature_names())
 
-    print(f"\n[Features] Morgan(r=2,2048) + MACCS(167) + AtomPair(2048) + RDKit(2048) + {len(_ALL_DESC_NAMES)} descriptors …")
-    X, valid_idx, feat_names = smiles_to_features(df["SMILES"].tolist())
-    y = df["pMIC"].iloc[valid_idx].values
-    print(f"[Features] Matrix: {X.shape}  |  invalid SMILES dropped: {len(df)-len(valid_idx)}")
+    cache_path = Path("cache_features_butina.joblib")
+    if cache_path.exists():
+        print(f"\n[Cache] Loading features + Butina split ← {cache_path}")
+        bundle = joblib.load(cache_path)
+        X = bundle["X"]; valid_idx = bundle["valid_idx"]; feat_names = bundle["feat_names"]
+        cluster_id = bundle["cluster_id"]; tr_idx = bundle["tr_idx"]; te_idx = bundle["te_idx"]
+        df_valid = df.iloc[valid_idx].reset_index(drop=True)
+        y = df_valid["pMIC"].values
+        smiles_valid = df_valid["SMILES"].tolist()
+        print(f"[Cache] Matrix: {X.shape}  |  Train {len(tr_idx)} / Test {len(te_idx)}")
+    else:
+        print(f"\n[Features] Morgan(r=2,2048) + MACCS(167) + AtomPair(2048) + RDKit(2048) + {len(_ALL_DESC_NAMES)} descriptors …")
+        X, valid_idx, feat_names = smiles_to_features(df["SMILES"].tolist())
+        df_valid = df.iloc[valid_idx].reset_index(drop=True)
+        y = df_valid["pMIC"].values
+        smiles_valid = df_valid["SMILES"].tolist()
+        print(f"[Features] Matrix: {X.shape}  |  invalid SMILES dropped: {len(df)-len(valid_idx)}")
 
-    print(f"\n[Data] Saving preprocessed data → {PREPROCESSED_DATA}")
-    save_preprocessed_data(df, valid_idx)
+        # ── Butina scaffold-style split (shared by reg + cls) ──────────────────
+        cluster_id = butina_clusters(
+            smiles_valid, dist_cutoff=BUTINA_DIST_CUTOFF, radius=2, n_bits=1024)
+        tr_idx, te_idx = cluster_train_test_split(
+            cluster_id, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+        print(f"[Cache] Saving → {cache_path}")
+        joblib.dump({
+            "X": X, "valid_idx": valid_idx, "feat_names": feat_names,
+            "cluster_id": cluster_id, "tr_idx": tr_idx, "te_idx": te_idx,
+        }, cache_path)
+
+    groups_tr = cluster_id[tr_idx]
+
+    # Threshold comparison on a variance-filtered feature subset (speed)
+    print("\n[Threshold] Preparing features for cutoff comparison …")
+    from sklearn.feature_selection import VarianceThreshold as _VT
+    _vt = _VT(0.01).fit(X[tr_idx])
+    X_tr_quick = _vt.transform(X[tr_idx]).astype(np.float32)
+    best_T, thresh_df = compare_pmic_thresholds(
+        X_tr_quick, y[tr_idx], groups_tr, thresholds=THRESHOLD_COMPARE)
+    thresh_df.to_csv("classification_threshold_comparison.csv", index=False)
+    print("  [saved] classification_threshold_comparison.csv")
+    PMIC_THRESHOLD = best_T
+    print(f"\n  *** Using PMIC_THRESHOLD = {PMIC_THRESHOLD} ***")
+
+    # Optional 3-class report (does not replace binary model)
+    try_three_class(X_tr_quick, y[tr_idx], groups_tr, _vt.transform(X[te_idx]).astype(np.float32), y[te_idx])
 
     np.random.seed(RANDOM_STATE)
 
-    best_reg_model, reg_transform_fn = run_regression(X, y, feat_names)
-    best_cls_model, cls_transform_fn = run_classification(X, y, feat_names)
+    best_reg_model, reg_transform_fn, reg_info = run_regression(
+        X, y, feat_names, tr_idx, te_idx, groups_tr)
+    best_cls_model, cls_transform_fn = run_classification(
+        X, y, feat_names, tr_idx, te_idx, groups_tr)
 
-    joblib.dump({"model": best_reg_model, "transform_fn": reg_transform_fn}, "best_reg_model.joblib")
+    # ── Split labels for every molecule ───────────────────────────────────────
+    split_labels = np.array(["Train"] * len(df_valid), dtype=object)
+    split_labels[te_idx] = "Test"
+    cv_folds_full = np.full(len(df_valid), -1, dtype=np.int16)
+    cv_folds_full[tr_idx] = reg_info["cv_fold_tr"]
+
+    print(f"\n[Data] Saving preprocessed data → {PREPROCESSED_DATA}")
+    save_preprocessed_data(
+        df, valid_idx,
+        split_labels=split_labels,
+        cv_folds=cv_folds_full,
+        cluster_ids=cluster_id,
+    )
+
+    # ── FP SHAP highlights: top-5 test + TB drugs mapping ─────────────────────
+    print("\n[Highlight] Morgan/MACCS SHAP bits on top-5 test + mapping drugs …")
+    smiles_te = [smiles_valid[i] for i in te_idx]
+    highlight_top_test_and_mapping(
+        smiles_te, reg_info["y_te_pred"], reg_info["y_te"],
+        reg_info["shap_values"], reg_info["feat_names_f"],
+        mapping_xlsx=MAPPING_XLSX,
+        out_dir=str(OUTPUT_DIR / "fp_highlights"),
+        top_n_mols=5, top_n_feats=12, n_bits=2048,
+    )
+
+    joblib.dump(
+        {"model": best_reg_model, "transform_fn": reg_transform_fn,
+         "pmic_threshold": PMIC_THRESHOLD, "butina_cutoff": BUTINA_DIST_CUTOFF},
+        "best_reg_model.joblib")
     print(f"  [saved] best_reg_model.joblib")
-    joblib.dump({"model": best_cls_model, "transform_fn": cls_transform_fn}, "best_cls_model.joblib")
+    joblib.dump(
+        {"model": best_cls_model, "transform_fn": cls_transform_fn,
+         "pmic_threshold": PMIC_THRESHOLD, "butina_cutoff": BUTINA_DIST_CUTOFF},
+        "best_cls_model.joblib")
     print(f"  [saved] best_cls_model.joblib")
 
-    n_plots = len(list(OUTPUT_DIR.glob("*.png")))
+    # ── External validation ───────────────────────────────────────────────────
+    run_external_validation(
+        best_reg_model, reg_transform_fn, best_cls_model, cls_transform_fn,
+        smiles_to_features, PMIC_THRESHOLD,
+        path=EXTERNAL_XLSX, out_dir=OUTPUT_DIR,
+    )
+
+    # ── Drug repurposing / NP candidate screens ───────────────────────────────
+    print("\n[Repurpose] Screening external libraries …")
+    try:
+        from predict_forxlsx import predict_file, load_models as _load_pred_models
+        # models already in memory — call predict_file with them
+        for f in REPURPOSE_FILES:
+            if Path(f).exists():
+                predict_file(f, best_reg_model, reg_transform_fn,
+                             best_cls_model, cls_transform_fn)
+            else:
+                print(f"  [SKIP] {f} not found")
+    except Exception as e:
+        print(f"  [WARN] Repurposing screen failed: {e}")
+
+    n_plots = len(list(OUTPUT_DIR.rglob("*.png")))
     print(f"\n{'='*60}")
     print(f"  {n_plots} plots saved → {OUTPUT_DIR.absolute()}")
+    print(f"  Active threshold used: pMIC ≥ {PMIC_THRESHOLD}")
     print("=" * 60)
 
 

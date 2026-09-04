@@ -59,7 +59,7 @@ try:
 except ImportError:
     HAS_LGB = False
 
-CACHE = Path("cache_features_butina.joblib")
+CACHE = Path(pp.FEATURE_CACHE)
 CLS_BUNDLE = Path("best_cls_model.joblib")
 REG_FULL_BUNDLE = Path("best_reg_model.joblib")
 OUT_DIR = Path("plots")
@@ -386,11 +386,7 @@ def main():
         print("\n" + "=" * 60)
         print("  EXTERNAL VALIDATION (cascade)")
         print("=" * 60)
-        edf = pd.read_excel(ext_path)
-        edf.columns = edf.columns.str.strip()
-        cm = {c.lower(): c for c in edf.columns}
-        edf = edf.rename(columns={cm["smiles"]: "SMILES", cm["pmic"]: "pMIC"})
-        edf = edf.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
+        edf = pp.load_labeled_smiles_table(ext_path, label="External")
         Xe, ok, _ = pp.smiles_to_features(edf["SMILES"].tolist())
         edf = edf.iloc[ok].reset_index(drop=True)
         ye = edf["pMIC"].values

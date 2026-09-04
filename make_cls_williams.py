@@ -14,7 +14,7 @@ if hasattr(sys.stdout, "reconfigure"):
 import pmic_prediction as pp
 from pmic_utils import FeatureTransformer  # noqa: F401
 
-CACHE = "cache_features_butina.joblib"
+CACHE = pp.FEATURE_CACHE
 CLS_BUNDLE = "best_cls_model.joblib"
 
 
@@ -57,10 +57,19 @@ def main():
     y_tr_proba = model.predict_proba(X_tr_f)[:, 1]
     y_te_proba = model.predict_proba(X_te_f)[:, 1]
 
+    X_ext_f = y_ext = y_ext_proba = None
+    ext = pp.load_external_features()
+    if ext is not None and len(ext["X"]):
+        X_ext_f = transform_fn(ext["X"])
+        y_ext = (ext["y"] >= thr).astype(int)
+        y_ext_proba = model.predict_proba(X_ext_f)[:, 1]
+        print(f"  External overlay: n={len(y_ext)}")
+
     stats = pp.plot_williams_classification(
         X_tr_f, X_te_f, y_tr, y_te, y_tr_proba, y_te_proba,
         fname="cls_13_williams_plot",
         title_suffix=f"pMIC≥{thr:g}",
+        X_ext_f=X_ext_f, y_ext=y_ext, y_ext_proba=y_ext_proba,
     )
     print("  AD summary:", stats)
     print(f"  [saved] plots/cls_13_williams_plot.png")

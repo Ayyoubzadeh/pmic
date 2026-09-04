@@ -29,7 +29,7 @@ from pmic_extras import (
     top_fp_features_from_shap,
 )
 
-CACHE = Path("cache_features_butina.joblib")
+CACHE = Path(pp.FEATURE_CACHE)
 THRESHOLD = 6.0
 OUT_HIGHLIGHT = Path("plots/fp_highlights_cls")
 N_SHAP = 200

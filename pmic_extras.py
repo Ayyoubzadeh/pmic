@@ -4,6 +4,7 @@ Extras for pMIC pipeline v3:
   • Butina (Tanimoto) cluster / scaffold-style split + GroupKFold groups
   • Classification threshold comparison (pMIC 5 / 6 / 7)
   • Fingerprint SHAP atom highlighting
+  • Canonical SMILES + duplicate collapse (mean pMIC) before featurization
   • External validation helpers
 """
 
@@ -33,6 +34,84 @@ from sklearn.metrics import (
 )
 
 warnings.filterwarnings("ignore")
+
+
+def canonical_smiles_of(smi):
+    """RDKit canonical SMILES, or None if unparseable / no heavy atoms."""
+    try:
+        mol = Chem.MolFromSmiles(str(smi).strip())
+    except Exception:
+        return None
+    if mol is None or mol.GetNumHeavyAtoms() == 0:
+        return None
+    try:
+        return Chem.MolToSmiles(mol, canonical=True)
+    except Exception:
+        return None
+
+
+def canonicalize_and_dedup(df, smiles_col="SMILES", pmic_col="pMIC", label="Data"):
+    """
+    Standardise SMILES to RDKit canonical form and collapse duplicate molecules
+    *before* fingerprint/descriptor construction.
+
+    If ``pmic_col`` is present, pMIC is averaged; other columns keep the first row.
+    If ``pmic_col`` is None or missing, keep the first occurrence of each molecule.
+    """
+    df = df.copy()
+    n_raw = len(df)
+    if smiles_col not in df.columns:
+        raise ValueError(f"{label}: missing '{smiles_col}' column")
+
+    df["_canonical"] = [canonical_smiles_of(s) for s in df[smiles_col]]
+    n_invalid = int(df["_canonical"].isna().sum())
+    df = df.dropna(subset=["_canonical"]).reset_index(drop=True)
+
+    has_pmic = pmic_col is not None and pmic_col in df.columns
+    n_conflict = 0
+    if has_pmic:
+        df[pmic_col] = pd.to_numeric(df[pmic_col], errors="coerce")
+        df = df.dropna(subset=[pmic_col]).reset_index(drop=True)
+    n_before = len(df)
+    if has_pmic:
+        n_conflict = int((df.groupby("_canonical", sort=False)[pmic_col].nunique() > 1).sum())
+        agg = {pmic_col: "mean"}
+        for c in df.columns:
+            if c in ("_canonical", pmic_col, smiles_col):
+                continue
+            agg[c] = "first"
+        out = df.groupby("_canonical", as_index=False, sort=False).agg(agg)
+    else:
+        out = df.drop_duplicates(subset=["_canonical"], keep="first").copy()
+        out = out.drop(columns=[smiles_col], errors="ignore")
+
+    n_dups = n_before - len(out)
+    msg = (f"[Canonical] {label}: raw={n_raw}  invalid={n_invalid}  "
+           f"unique={len(out)}  dups_removed={n_dups}")
+    if has_pmic:
+        msg += f"  conflicting_pMIC_groups={n_conflict}"
+    print(msg)
+
+    out[smiles_col] = out["_canonical"]
+    out = out.drop(columns=["_canonical"])
+    return out.reset_index(drop=True)
+
+
+def load_labeled_smiles_table(path, label=None):
+    """Read a SMILES + pMIC table, canonicalize, and mean-aggregate duplicates."""
+    path = Path(path)
+    ext = path.suffix.lower()
+    df = pd.read_excel(path) if ext in (".xlsx", ".xls") else pd.read_csv(path)
+    df.columns = df.columns.str.strip()
+    col_map = {c.lower(): c for c in df.columns}
+    if "smiles" not in col_map:
+        raise ValueError(f"{path.name} must have a SMILES column")
+    if "pmic" not in col_map:
+        raise ValueError(f"{path.name} must have a pMIC column")
+    df = df.rename(columns={col_map["smiles"]: "SMILES", col_map["pmic"]: "pMIC"})
+    df = df.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
+    return canonicalize_and_dedup(df, label=label or path.name)
+
 
 # ── Butina / scaffold split ───────────────────────────────────────────────────
 
@@ -433,11 +512,7 @@ def run_external_validation(
     print("\n" + "═" * 60)
     print(f"  EXTERNAL VALIDATION  ← {path.name}")
     print("═" * 60)
-    df = pd.read_excel(path)
-    df.columns = df.columns.str.strip()
-    col_map = {c.lower(): c for c in df.columns}
-    df = df.rename(columns={col_map["smiles"]: "SMILES", col_map["pmic"]: "pMIC"})
-    df = df.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
+    df = load_labeled_smiles_table(path)
 
     X, valid_idx, _ = smiles_to_features_fn(df["SMILES"].tolist())
     dfv = df.iloc[valid_idx].reset_index(drop=True)

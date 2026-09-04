@@ -10,6 +10,7 @@ New vs v2:
   • Dataset_role labels: Train/CV-fold-k vs Test in preprocessed_data.xlsx
   • Highlight top Morgan/MACCS SHAP bits on top-5 test mols + mapping drugs
   • External validation (Cleaned_External_Validation.xlsx)
+  • Canonical SMILES + duplicate collapse (mean pMIC) before featurization
   • Auto-screen approved / 4FDN / CyanoMetDB for repurposing candidates
 
 Install:
@@ -119,6 +120,7 @@ FEATURES_LIST     = "generated_features.txt"
 THRESHOLD_COMPARE = (5.5, 6.0)  # 7 excluded: too sparse; external often has no actives
 MAPPING_XLSX      = "SMILES for mapping.xlsx"
 EXTERNAL_XLSX     = "Cleaned_External_Validation.xlsx"
+FEATURE_CACHE     = "cache_features_butina_canonical.joblib"
 REPURPOSE_FILES   = [
     "approved.xlsx",
     "4FDN-Natural-products-dock.xlsx",
@@ -131,9 +133,10 @@ plt.rcParams.update({
 })
 
 SET_STYLE = {
-    "Train": dict(color="#2196F3", marker="o", label="Train"),
-    "CV":    dict(color="#FF9800", marker="D", label="CV (OOF)"),
-    "Test":  dict(color="#F44336", marker="s", label="Test"),
+    "Train":    dict(color="#2196F3", marker="o", label="Train"),
+    "CV":       dict(color="#FF9800", marker="D", label="CV (OOF)"),
+    "Test":     dict(color="#F44336", marker="s", label="Test"),
+    "External": dict(color="#4CAF50", marker="^", label="External"),
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -159,7 +162,9 @@ def load_data(filepath):
         print(f"[Data] Loaded {len(df)} rows from {filepath}")
     else:
         print("[Data] No file provided"); exit()
-    return df.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
+    df = df.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
+    from pmic_extras import canonicalize_and_dedup as _canon_dedup
+    return _canon_dedup(df, label=Path(filepath).name)
 
 
 def save_preprocessed_data(df, valid_idx, path=PREPROCESSED_DATA,
@@ -267,6 +272,7 @@ from pmic_extras import (
     butina_clusters, cluster_train_test_split, make_group_cv, cv_fold_labels,
     compare_pmic_thresholds, try_three_class,
     highlight_top_test_and_mapping, run_external_validation,
+    canonicalize_and_dedup, load_labeled_smiles_table,
 )
 
 
@@ -716,67 +722,199 @@ def optimal_threshold(y_true, y_proba):
     return float(thresholds[np.argmax(scores)])
 
 
-def plot_williams_classification(X_tr_f, X_te_f, y_tr, y_te, y_tr_proba, y_te_proba,
-                                 fname="cls_13_williams_plot", title_suffix=""):
-    """
-    Williams plot for classification applicability domain.
-    Leverage from PCA of the selected feature space; standardised residual of
-    probability: (y_true − P_active) / σ_train.
-    """
+def fit_leverage_ad(X_tr_f, random_state=RANDOM_STATE):
+    """PCA-space hat matrix on training selected features. Returns AD model + h_train."""
     n_comp = min(50, X_tr_f.shape[0] - 1, X_tr_f.shape[1])
     scaler = StandardScaler().fit(X_tr_f)
-    pca = PCA(n_components=n_comp, random_state=RANDOM_STATE).fit(scaler.transform(X_tr_f))
-    Z_tr = pca.transform(scaler.transform(X_tr_f))
-    Z_te = pca.transform(scaler.transform(X_te_f))
+    pca_in = scaler.transform(X_tr_f)
+    pca = PCA(n_components=n_comp, random_state=random_state).fit(pca_in)
+    Z_tr = pca.transform(pca_in)
     XtXinv = np.linalg.pinv(Z_tr.T @ Z_tr)
+    h_star = 3.0 * (n_comp + 1) / float(len(X_tr_f))
     h_tr = np.einsum("ij,jk,ik->i", Z_tr, XtXinv, Z_tr)
-    h_te = np.einsum("ij,jk,ik->i", Z_te, XtXinv, Z_te)
-    h_star = 3.0 * (n_comp + 1) / len(X_tr_f)
+    return {
+        "scaler": scaler,
+        "pca": pca,
+        "XtXinv": XtXinv,
+        "h_star": float(h_star),
+        "n_comp": int(n_comp),
+        "h_tr": h_tr,
+    }
 
-    res_tr = y_tr.astype(float) - y_tr_proba
-    res_te = y_te.astype(float) - y_te_proba
-    sigma = float(res_tr.std()) + 1e-12
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for h, res, name in [(h_tr, res_tr, "Train"), (h_te, res_te, "Test")]:
-        std_r = res / sigma
+def leverage_h(X_f, ad):
+    """Leverage h for rows of selected-feature matrix X_f using a fitted AD model."""
+    Z = ad["pca"].transform(ad["scaler"].transform(X_f))
+    return np.einsum("ij,jk,ik->i", Z, ad["XtXinv"], Z)
+
+
+def in_ad_mask(h, residual=None, h_star=None, sigma=None, residual_cutoff=3.0):
+    ok = np.asarray(h) <= h_star
+    if residual is not None and sigma is not None:
+        ok = ok & (np.abs(np.asarray(residual) / (float(sigma) + 1e-12)) <= residual_cutoff)
+    return ok
+
+
+def ad_coverage_row(dataset, h, residual, h_star, sigma, labeled=True):
+    """One summary row: % in-AD. Labeled = leverage + |std residual|≤3; else leverage only."""
+    h = np.asarray(h, dtype=float)
+    if labeled and residual is not None:
+        mask = in_ad_mask(h, residual, h_star, sigma)
+        criterion = "leverage+residual"
+    else:
+        mask = in_ad_mask(h, None, h_star, None)
+        criterion = "leverage"
+    n = int(len(h))
+    n_in = int(mask.sum()) if n else 0
+    pct = (100.0 * n_in / n) if n else 0.0
+    return {
+        "dataset": dataset,
+        "n_valid": n,
+        "n_in_ad": n_in,
+        "pct_in_ad": pct,
+        "criterion": criterion,
+        "h_star": float(h_star),
+    }
+
+
+def draw_williams_ax(ax, series, h_star, sigma):
+    """Scatter Train/Test/External on a Williams axis. Legend shows in-AD %."""
+    stats = {"h_star": float(h_star), "sigma": float(sigma)}
+    for item in series:
+        name = item["name"]
+        h = np.asarray(item["h"], dtype=float)
+        res = np.asarray(item["residual"], dtype=float)
+        std_r = res / (float(sigma) + 1e-12)
         outlier = (h > h_star) | (np.abs(std_r) > 3)
-        s = SET_STYLE[name]
+        n = len(h)
+        n_in = int((~outlier).sum())
+        pct = (100.0 * n_in / n) if n else 0.0
+        s = SET_STYLE.get(name, dict(color="gray", marker="o"))
         ax.scatter(h[~outlier], std_r[~outlier], s=30, alpha=0.7,
                    color=s["color"], marker=s["marker"], edgecolors="none",
-                   label=f"{name} (in-AD: {int((~outlier).sum())})")
-        ax.scatter(h[outlier], std_r[outlier], s=50, alpha=0.9,
-                   color=s["color"], marker="X", edgecolors="black", lw=0.5,
-                   label=f"{name} outlier ({int(outlier.sum())})")
+                   label=f"{name} in-AD: {pct:.1f}% (n={n})")
+        if outlier.any():
+            ax.scatter(h[outlier], std_r[outlier], s=50, alpha=0.9,
+                       color=s["color"], marker="X", edgecolors="black", lw=0.5,
+                       label=f"{name} out-AD: {100.0 - pct:.1f}%")
+        key = name.lower()
+        stats[f"{key}_in_ad"] = n_in
+        stats[f"{key}_outlier"] = int(outlier.sum())
+        stats[f"{key}_pct_in_ad"] = pct
+        stats[f"{key}_n"] = n
     ax.axhline(3, color="crimson", linestyle="--", lw=1.5, label="±3σ")
     ax.axhline(-3, color="crimson", linestyle="--", lw=1.5)
     ax.axvline(h_star, color="darkorange", linestyle="--", lw=1.8,
                label=f"h*={h_star:.3f}")
     ax.set_xlabel("Leverage  h")
-    ax.set_ylabel("Standardised Residual  (y − P_active) / σ")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    return stats
+
+
+def plot_williams_sets(series, h_star, sigma, fname, title, ylabel):
+    fig, ax = plt.subplots(figsize=(8.5, 6.2))
+    stats = draw_williams_ax(ax, series, h_star, sigma)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontweight="bold")
+    plt.tight_layout()
+    save_fig(fig, fname)
+    return stats
+
+
+_LIB_BAR_COLORS = {
+    "Approved": "#9C27B0",
+    "4FDN": "#FF9800",
+    "CyanoMetDB": "#00BCD4",
+    "COCONUT": "#6D4C41",
+}
+
+
+def plot_ad_dataset_coverage(scatter_series, h_star, sigma, rows, fname, title, ylabel):
+    """Two-panel AD figure: Williams (Train/Test/External) + % in-AD bars for all sets."""
+    fig, axes = plt.subplots(
+        1, 2, figsize=(14.5, 6.2), gridspec_kw={"width_ratios": [1.2, 1.0]})
+    draw_williams_ax(axes[0], scatter_series, h_star, sigma)
+    axes[0].set_ylabel(ylabel)
+    axes[0].set_title("Williams plot", fontweight="bold")
+
+    names = [r["dataset"] for r in rows]
+    pcts = [float(r["pct_in_ad"]) for r in rows]
+    colors = []
+    for n in names:
+        if n in SET_STYLE:
+            colors.append(SET_STYLE[n]["color"])
+        else:
+            colors.append(_LIB_BAR_COLORS.get(n, "#607D8B"))
+    y = np.arange(len(names))
+    axes[1].barh(y, pcts, color=colors, edgecolor="white", height=0.7)
+    axes[1].set_yticks(y)
+    axes[1].set_yticklabels(names)
+    axes[1].invert_yaxis()
+    axes[1].set_xlim(0, 125)
+    axes[1].set_xlabel("% in applicability domain")
+    axes[1].set_title("AD coverage by dataset", fontweight="bold")
+    axes[1].grid(axis="x", alpha=0.3)
+    for i, r in enumerate(rows):
+        axes[1].text(
+            min(float(r["pct_in_ad"]) + 1.5, 123), i,
+            f"{r['pct_in_ad']:.1f}%  (n={r['n_valid']})",
+            va="center", fontsize=9)
+    fig.suptitle(title, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    save_fig(fig, fname)
+
+
+def load_external_features():
+    """Canonicalized external set with raw feature matrix (same space as smiles_to_features)."""
+    path = Path(EXTERNAL_XLSX)
+    if not path.exists():
+        print(f"[External] {path} not found — Williams without External overlay")
+        return None
+    df = load_labeled_smiles_table(path, label="External")
+    X, ok, _ = smiles_to_features(df["SMILES"].tolist())
+    df = df.iloc[ok].reset_index(drop=True)
+    print(f"[External] featurized {len(df)} molecules for AD overlay")
+    return {"X": X, "y": df["pMIC"].values, "df": df}
+
+
+def plot_williams_classification(X_tr_f, X_te_f, y_tr, y_te, y_tr_proba, y_te_proba,
+                                 fname="cls_13_williams_plot", title_suffix="",
+                                 X_ext_f=None, y_ext=None, y_ext_proba=None):
+    """
+    Williams plot for classification applicability domain.
+    Leverage from PCA of the selected feature space; standardised residual of
+    probability: (y_true − P_active) / σ_train.
+    """
+    ad = fit_leverage_ad(X_tr_f)
+    res_tr = y_tr.astype(float) - y_tr_proba
+    res_te = y_te.astype(float) - y_te_proba
+    sigma = float(res_tr.std()) + 1e-12
+    series = [
+        dict(name="Train", h=ad["h_tr"], residual=res_tr),
+        dict(name="Test", h=leverage_h(X_te_f, ad), residual=res_te),
+    ]
+    if (X_ext_f is not None and y_ext is not None and y_ext_proba is not None
+            and len(X_ext_f)):
+        series.append(dict(
+            name="External",
+            h=leverage_h(X_ext_f, ad),
+            residual=np.asarray(y_ext, dtype=float) - np.asarray(y_ext_proba, dtype=float),
+        ))
     ttl = "Williams Plot — Classification AD"
     if title_suffix:
         ttl = f"{ttl} — {title_suffix}"
-    ax.set_title(ttl, fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    save_fig(fig, fname)
-    return {
-        "h_star": h_star,
-        "n_comp": n_comp,
-        "sigma": sigma,
-        "train_in_ad": int(((h_tr <= h_star) & (np.abs(res_tr / sigma) <= 3)).sum()),
-        "train_outlier": int(((h_tr > h_star) | (np.abs(res_tr / sigma) > 3)).sum()),
-        "test_in_ad": int(((h_te <= h_star) & (np.abs(res_te / sigma) <= 3)).sum()),
-        "test_outlier": int(((h_te > h_star) | (np.abs(res_te / sigma) > 3)).sum()),
-    }
+    stats = plot_williams_sets(
+        series, ad["h_star"], sigma, fname, ttl,
+        "Standardised Residual  (y − P_active) / σ")
+    stats["n_comp"] = ad["n_comp"]
+    return stats
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REGRESSION PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
-def run_regression(X, y, feat_names, tr_idx, te_idx, groups_tr):
+def run_regression(X, y, feat_names, tr_idx, te_idx, groups_tr, ext=None):
     print("\n" + "═" * 60)
     print("  REGRESSION  (predict pMIC)  — Butina cluster split")
     print("═" * 60)
@@ -992,35 +1130,25 @@ def run_regression(X, y, feat_names, tr_idx, te_idx, groups_tr):
 
     # ── [12] Williams plot ────────────────────────────────────────────────────
     print("[12/13] Williams plot (Applicability Domain)")
-    n_comp = min(50, X_tr_f.shape[0] - 1, X_tr_f.shape[1])
-    scaler = StandardScaler().fit(X_tr_f)
-    pca    = PCA(n_components=n_comp, random_state=RANDOM_STATE).fit(scaler.transform(X_tr_f))
-    Z_tr   = pca.transform(scaler.transform(X_tr_f))
-    Z_te   = pca.transform(scaler.transform(X_te_f))
-    XtXinv = np.linalg.pinv(Z_tr.T @ Z_tr)
-    h_tr   = np.einsum("ij,jk,ik->i", Z_tr, XtXinv, Z_tr)
-    h_te   = np.einsum("ij,jk,ik->i", Z_te, XtXinv, Z_te)
-    h_star = 3 * (n_comp + 1) / len(X_tr_f)
-    sigma  = res_tr.std() + 1e-12
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for h, res, name in [(h_tr, res_tr, "Train"), (h_te, res_te, "Test")]:
-        std_r   = res / sigma
-        outlier = (h > h_star) | (np.abs(std_r) > 3)
-        s       = SET_STYLE[name]
-        ax.scatter(h[~outlier], std_r[~outlier], s=30, alpha=0.7,
-                   color=s["color"], marker=s["marker"], edgecolors="none",
-                   label=f"{name} (in-AD: {(~outlier).sum()})")
-        ax.scatter(h[outlier], std_r[outlier], s=50, alpha=0.9,
-                   color=s["color"], marker="X", edgecolors="black", lw=0.5,
-                   label=f"{name} outlier ({outlier.sum()})")
-    ax.axhline(3, color="crimson", linestyle="--", lw=1.5, label="±3σ")
-    ax.axhline(-3, color="crimson", linestyle="--", lw=1.5)
-    ax.axvline(h_star, color="darkorange", linestyle="--", lw=1.8, label=f"h*={h_star:.3f}")
-    ax.set_xlabel("Leverage  h"); ax.set_ylabel("Standardised Residual")
-    ax.set_title("Williams Plot — Applicability Domain", fontweight="bold")
-    ax.legend(fontsize=9); ax.grid(alpha=0.3)
-    plt.tight_layout(); save_fig(fig, "reg_12_williams_plot")
+    ad = fit_leverage_ad(X_tr_f)
+    sigma = float(res_tr.std()) + 1e-12
+    series = [
+        dict(name="Train", h=ad["h_tr"], residual=res_tr),
+        dict(name="Test", h=leverage_h(X_te_f, ad), residual=res_te),
+    ]
+    if ext is not None and len(ext.get("X", [])):
+        X_ext_f = transform_fn(ext["X"])
+        y_ext_pred = best_model.predict(X_ext_f)
+        series.append(dict(
+            name="External",
+            h=leverage_h(X_ext_f, ad),
+            residual=ext["y"] - y_ext_pred,
+        ))
+        print(f"  External overlay: n={len(ext['y'])}")
+    plot_williams_sets(
+        series, ad["h_star"], sigma, "reg_12_williams_plot",
+        "Williams Plot — Applicability Domain",
+        "Standardised Residual")
 
     # ── [13] RMSE comparison across all models ────────────────────────────────
     print("[13/13] RMSE comparison — all models")
@@ -1044,7 +1172,7 @@ def run_regression(X, y, feat_names, tr_idx, te_idx, groups_tr):
 # ══════════════════════════════════════════════════════════════════════════════
 # CLASSIFICATION PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
-def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr):
+def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr, ext=None):
     print("\n" + "═" * 60)
     print(f"  CLASSIFICATION  (Active: pMIC ≥ {PMIC_THRESHOLD}  |  Inactive: pMIC < {PMIC_THRESHOLD})")
     print("═" * 60)
@@ -1301,10 +1429,17 @@ def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr):
 
     # ── [13] Williams plot (Applicability Domain) ─────────────────────────────
     print("[13/13] Williams plot (Classification Applicability Domain)")
+    X_ext_f = y_ext_bin = y_ext_proba = None
+    if ext is not None and len(ext.get("X", [])):
+        X_ext_f = transform_fn(ext["X"])
+        y_ext_bin = (ext["y"] >= PMIC_THRESHOLD).astype(int)
+        y_ext_proba = best_model.predict_proba(X_ext_f)[:, 1]
+        print(f"  External overlay: n={len(y_ext_bin)}")
     plot_williams_classification(
         X_tr_f, X_te_f, y_tr, y_te, y_tr_proba, y_te_proba,
         fname="cls_13_williams_plot",
         title_suffix=f"{best_name} (pMIC≥{PMIC_THRESHOLD})",
+        X_ext_f=X_ext_f, y_ext=y_ext_bin, y_ext_proba=y_ext_proba,
     )
 
     for name, yt, yp in [("Train", y_tr, y_tr_pred),
@@ -1336,7 +1471,7 @@ def main():
 
     save_feature_list(build_feature_names())
 
-    cache_path = Path("cache_features_butina.joblib")
+    cache_path = Path(FEATURE_CACHE)
     if cache_path.exists():
         print(f"\n[Cache] Loading features + Butina split ← {cache_path}")
         bundle = joblib.load(cache_path)
@@ -1384,10 +1519,12 @@ def main():
 
     np.random.seed(RANDOM_STATE)
 
+    ext_ad = load_external_features()
+
     best_reg_model, reg_transform_fn, reg_info = run_regression(
-        X, y, feat_names, tr_idx, te_idx, groups_tr)
+        X, y, feat_names, tr_idx, te_idx, groups_tr, ext=ext_ad)
     best_cls_model, cls_transform_fn = run_classification(
-        X, y, feat_names, tr_idx, te_idx, groups_tr)
+        X, y, feat_names, tr_idx, te_idx, groups_tr, ext=ext_ad)
 
     # ── Split labels for every molecule ───────────────────────────────────────
     split_labels = np.array(["Train"] * len(df_valid), dtype=object)

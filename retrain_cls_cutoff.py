@@ -3,7 +3,7 @@
 Retrain classification only at cutoff 5.5 vs 6.0 (pick best),
 then refresh external validation and library screens.
 
-Uses cache_features_butina.joblib + existing best_reg_model.joblib
+Uses cache_features_butina_canonical.joblib + existing best_reg_model.joblib
 (regression unchanged).
 """
 
@@ -22,7 +22,7 @@ import pmic_prediction as pp
 from pmic_extras import compare_pmic_thresholds, run_external_validation
 from sklearn.feature_selection import VarianceThreshold
 
-CACHE = Path("cache_features_butina.joblib")
+CACHE = Path(pp.FEATURE_CACHE)
 DATA = pp.DATA
 THRESHOLDS = (5.5, 6.0)
 REPURPOSE = [
@@ -65,10 +65,7 @@ def main():
     # Also evaluate both cutoffs on external set with a quick RF for transparency
     ext_path = Path(pp.EXTERNAL_XLSX)
     if ext_path.exists():
-        edf = pd.read_excel(ext_path)
-        edf.columns = edf.columns.str.strip()
-        cm = {c.lower(): c for c in edf.columns}
-        edf = edf.rename(columns={cm["smiles"]: "SMILES", cm["pmic"]: "pMIC"})
+        edf = pp.load_labeled_smiles_table(ext_path, label="External")
         print("\n  External label availability:")
         for T in THRESHOLDS:
             n_act = int((edf["pMIC"] >= T).sum())
@@ -78,8 +75,9 @@ def main():
     pp.PMIC_THRESHOLD = best_T
     print(f"\n  *** Using PMIC_THRESHOLD = {best_T:.1f} ***\n")
 
+    ext_ad = pp.load_external_features()
     best_cls, cls_tf = pp.run_classification(
-        X, y, feat_names, tr_idx, te_idx, groups_tr)
+        X, y, feat_names, tr_idx, te_idx, groups_tr, ext=ext_ad)
 
     # Keep regression bundle; update cls + threshold metadata
     reg = joblib.load("best_reg_model.joblib")

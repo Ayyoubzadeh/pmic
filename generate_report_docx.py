@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Methods & Results DOCX for pMIC pipeline v3 (canonical SMILES + AD)."""
+"""Generate Methods & Results DOCX for the AllStrainsExceptResistant pipeline run."""
 
 from pathlib import Path
 from docx import Document
@@ -12,7 +12,8 @@ from docx.oxml import OxmlElement
 ROOT = Path(".")
 PLOTS = ROOT / "plots"
 FP_REG = PLOTS / "fp_highlights"
-OUT = ROOT / "pMIC_Pipeline_v3_Methods_Results_Report.docx"
+FP_CLS = PLOTS / "fp_highlights_cls"
+OUT = ROOT / "pMIC_Pipeline_v3_AllStrains_Methods_Results_Report.docx"
 
 
 def shade(cell, hex_color):
@@ -107,8 +108,9 @@ def build():
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = sub.add_run(
         "Methods and Results Report\n"
-        "Canonical SMILES · Duplicate collapse · Butina/Tanimoto split ·\n"
-        "Classification (pMIC ≥ 6) · Regression · Cascade · Applicability Domain · External Validation"
+        "Primary dataset: AllStrainsExceptResistant  |  "
+        "Two-stage SMILES deduplication (median pMIC)  |  "
+        "OOF threshold  |  CV Average Precision  |  Sensitivity analysis"
     )
     r.italic = True
     r.font.size = Pt(11)
@@ -116,35 +118,35 @@ def build():
     meta = doc.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = meta.add_run(
-        "Modeling set after canonicalization: n = 19,183 unique molecules  |  "
-        "Activity cutoff: pMIC ≥ 6.0  |  Seed = 42"
+        "Unique molecules after dedup: n = 18,918  |  "
+        "Activity cutoff: pMIC >= 6.0  |  "
+        "OOF decision threshold = 0.050  |  Seed = 42  |  25 September 2026"
     )
     r.font.size = Pt(10)
 
     # ── 1 Overview ──────────────────────────────────────────────────────────
     H(doc, "1. Overview", 1)
     P(doc,
-      "This report documents a scaffold-aware quantitative structure–activity relationship "
-      "(QSAR) pipeline for antimycobacterial potency (pMIC). SMILES strings were converted "
-      "to RDKit canonical form and duplicate molecules were collapsed before fingerprint "
-      "construction, so that one chemical entity could not enter the model under two "
-      "different SMILES writings. The workflow then combined multi-fingerprint molecular "
-      "representation, Butina clustering with Tanimoto similarity for train/test partitioning "
-      "and GroupKFold cross-validation, multi-model ensembles, SHAP-based fingerprint "
-      "highlighting, classification cutoff selection between pMIC 5.5 and 6.0, Williams "
-      "applicability-domain (AD) analysis with percent coverage of external and screening "
-      "libraries, labeled external validation, and virtual screening of approved drugs, "
-      "4FDN natural products, CyanoMetDB, and COCONUT.")
+      "This report documents the retrain of the antimycobacterial pMIC QSAR pipeline on "
+      "the revised modeling table AllStrainsExceptResistant.xlsx. After two-stage SMILES "
+      "deduplication (exact string, then RDKit canonical SMILES) with median pMIC, the "
+      "workflow used multi-fingerprint representation, a Butina/Tanimoto cluster split "
+      "with GroupKFold, stacking regression, binary classification at pMIC >= 6 selected "
+      "by out-of-fold Average Precision, OOF decision-threshold optimization frozen before "
+      "test evaluation, signed per-bit SHAP mapping, labeled external validation, "
+      "sensitivity analysis of the frozen model on H37Rv and Resistant tables, and "
+      "virtual screening of approved drugs, 4FDN natural products, and CyanoMetDB.")
 
     H(doc, "1.1 Objectives", 2)
     bullets(doc, [
-        "Standardize SMILES and remove intra-set molecular duplicates before featurization.",
-        "Predict continuous pMIC (regression) under chemically rigorous splits.",
-        "Classify Active vs Inactive at an evidence-based cutoff (pMIC ≥ 6.0).",
-        "Avoid chemical leakage via Butina/Tanimoto cluster assignment.",
-        "Quantify whether test, external, and screening libraries fall inside the AD, as percentages.",
-        "Interpret influential Morgan/MACCS bits and map them onto molecules.",
-        "Validate externally and screen approved drugs, 4FDN NPs, CyanoMetDB, and COCONUT.",
+        "Retrain the main model on AllStrainsExceptResistant as the sole modeling set.",
+        "Collapse exact-SMILES and canonical-SMILES duplicates to one median pMIC on every labeled table, including External, H37Rv, and Resistant.",
+        "Plot the pMIC distribution before the train/test split and assess class balance at cutoff 6.",
+        "Select classifiers by GroupKFold Average Precision (active ranking under imbalance).",
+        "Optimize the classification decision threshold on OOF probabilities only, then evaluate Test, External, and screens at that frozen threshold.",
+        "Run sensitivity analysis of the frozen main model on H37Rv and Resistant, reporting overlap-aware metrics.",
+        "Screen approved, 4FDN, and CyanoMetDB libraries with the same frozen models.",
+        "Map influential Morgan/MACCS bits individually with signed (positive/negative) SHAP contribution.",
     ])
 
     # ── 2 Methods ───────────────────────────────────────────────────────────
@@ -152,42 +154,48 @@ def build():
 
     H(doc, "2.1 Datasets and endpoint", 2)
     P(doc,
-      "Modeling data (Smiles.xlsx) originally comprised 35,948 rows with experimental pMIC. "
-      "pMIC is −log₁₀(MIC [M]). An independent labeled set (Cleaned_External_Validation.xlsx, "
-      "122 rows) was used only for final evaluation. Unlabeled libraries: approved DrugBank "
-      "compounds, 4FDN natural-product docking set, CyanoMetDB V03 2024, and COCONUT "
-      "(July 2026 dump).")
+      "The primary modeling file was AllStrainsExceptResistant.xlsx (29,067 rows as loaded; "
+      "29,065 rows with numeric pMIC). pMIC is -log10(MIC [M]). Two additional labeled "
+      "tables, H37Rv.xlsx and Resistant.xlsx, were not used for training; they were scored "
+      "with the frozen main model for sensitivity analysis. Cleaned_External_Validation.xlsx "
+      "was used only after model selection. Unlabeled screening libraries: approved drugs, "
+      "4FDN natural-product docking set, and CyanoMetDB V03 2024. COCONUT was not rescreened "
+      "in this run (models were saved so that predict_coconut.py can be applied later).")
 
-    H(doc, "2.2 Canonical SMILES and duplicate removal", 2)
+    H(doc, "2.2 Two-stage SMILES deduplication", 2)
     P(doc,
-      "Before any fingerprint or descriptor was computed, each SMILES string was parsed with "
-      "RDKit and rewritten as Chem.MolToSmiles(..., canonical=True). Invalid structures and "
-      "molecules with zero heavy atoms were dropped. Rows sharing the same canonical SMILES "
-      "were collapsed to one molecule: pMIC was averaged and remaining columns kept the first "
-      "occurrence. This prevents the same compound, written with two different SMILES strings, "
-      "from entering the model as two independent training points. Salt stripping and charge "
-      "neutralization were not applied. The same canonicalize-and-mean protocol was used on "
-      "the labeled external set.")
+      "Before fingerprints were computed, each labeled table was collapsed in two stages. "
+      "(1) Exact SMILES: strings were stripped and grouped; when the same SMILES appeared "
+      "in multiple assay rows with different pMIC values, a single median pMIC was retained "
+      "(other columns: first occurrence). (2) Canonical SMILES: RDKit Chem.MolToSmiles(..., "
+      "canonical=True) was applied; invalid structures and zero-heavy-atom molecules were "
+      "dropped; remaining canonical duplicates were again aggregated by median pMIC. "
+      "Unlabeled tables would keep the first occurrence. Salt stripping was not applied. "
+      "Median was chosen over the mean as a robust summary of conflicting assay conditions.")
     P(doc,
-      "After canonicalization the modeling table contained 19,183 unique molecules "
-      "(16,765 duplicate rows removed; 4,204 groups had conflicting experimental pMIC and "
-      "were averaged). pMIC ranged from 2.17 to 9.00. The external set collapsed from 122 "
-      "to 92 unique molecules (30 duplicates; 3 conflicting-pMIC groups).")
+      "On AllStrainsExceptResistant this reduced 29,065 usable rows to 18,918 unique molecules "
+      "(10,147 exact duplicates removed; 3,014 exact-SMILES groups had conflicting pMIC). "
+      "After the exact-string collapse, no additional canonical duplicates remained. "
+      "pMIC ranged from 1.87 to 9.50.")
 
-    H(doc, "2.3 Molecular representation", 2)
+    H(doc, "2.3 Class balance, SMOTE policy, and pre-split plot", 2)
+    P(doc,
+      "A binned pMIC bar plot and Active/Inactive counts at cutoff 6 were drawn on the "
+      "unique modeling set before the Butina split. At pMIC >= 6 there were 2,832 actives "
+      "out of 18,918 (15.0%). SMOTE was not applied: interpolating in mixed Morgan/MACCS/"
+      "descriptor space yields chemically invalid bits. Class imbalance was handled with "
+      "class_weight='balanced' and OOF decision-threshold calibration.")
+
+    H(doc, "2.4 Molecular representation", 2)
     bullets(doc, [
         "Morgan fingerprints (radius 2, 2048 bits)",
         "MACCS keys (167 bits)",
         "Atom-pair fingerprints (2048 bits)",
         "RDKit path fingerprints (2048 bits)",
-        "216 RDKit descriptors (Ipc excluded) → 6,527 features in total",
+        "216 RDKit descriptors (Ipc excluded) -> 6,527 features in total",
     ])
-    P(doc,
-      "Invalid SMILES remaining after canonicalization and zero-heavy-atom structures were "
-      "dropped during featurization (none remained in the modeling set). Descriptors were "
-      "sanitized (NaN/Inf → 0; clipped).")
 
-    H(doc, "2.4 Feature selection", 2)
+    H(doc, "2.5 Feature selection", 2)
     bullets(doc, [
         "VarianceThreshold (0.01)",
         "Pearson correlation filter (|r| > 0.95)",
@@ -195,428 +203,434 @@ def build():
         "Selectors fit on training data only and stored in a picklable FeatureTransformer",
     ])
 
-    H(doc, "2.5 Butina cluster split (scaffold-aware)", 2)
+    H(doc, "2.6 Butina cluster split", 2)
     P(doc,
-      "Molecules were clustered with the Butina algorithm on Morgan fingerprints "
-      "(radius 2, 1024 bits) using Tanimoto distance cutoff 0.4 (similarity ≥ 0.6). "
-      "Entire clusters were assigned to train or test (~80/20) with size-balanced allocation. "
-      "Within-train CV used GroupKFold by cluster ID (5 folds), preventing cluster leakage.")
+      "Molecules were clustered with Butina on Morgan fingerprints (radius 2, 1024 bits) "
+      "at Tanimoto distance cutoff 0.4 (similarity >= 0.6). Entire clusters were assigned "
+      "to train or test (~80/20). Within-train CV used GroupKFold by cluster (5 folds).")
     P(doc,
-      "Partition after unique-molecule modeling: 4,470 clusters (2,164 singletons); "
-      "Train n = 15,346 (2,585 clusters); Test n = 3,837 (1,885 clusters). Each molecule "
-      "was labeled in preprocessed_data.xlsx with Split, CV_fold / Dataset_role, and "
-      "Butina_cluster.")
+      "Result: 4,368 clusters (2,091 singletons); Train n = 15,134 (2,527 clusters); "
+      "Test n = 3,784 (1,841 clusters). Roles were written to preprocessed_data.xlsx.")
 
-    H(doc, "2.6 Models", 2)
+    H(doc, "2.7 Models", 2)
     P(doc, "Regression candidates:", bold=True)
     bullets(doc, [
-        "RandomForest, ExtraTrees, HistGradientBoosting, Ridge, LinearSVR",
-        "XGBoost, LightGBM",
-        "StackingRegressor of top-3 trees → Ridge",
+        "RandomForest, ExtraTrees, HistGradientBoosting, Ridge, LinearSVR, XGBoost, LightGBM",
+        "StackingRegressor of the top-3 trees by CV R2 -> Ridge",
     ])
     P(doc, "Classification candidates:", bold=True)
     bullets(doc, [
         "Calibrated LinearSVC, LogisticRegression (balanced)",
-        "RandomForest, ExtraTrees, HistGradientBoosting (balanced)",
-        "XGBoost, LightGBM; StackingClassifier → LogisticRegression",
-        "Decision threshold optimized on train probabilities (balanced accuracy)",
-        "Gray-zone exclusion: |pMIC − cutoff| < 0.5 removed from classification training",
+        "RandomForest, ExtraTrees, HistGradientBoosting (balanced), XGBoost, LightGBM",
+        "StackingClassifier of the top-3 trees by CV Average Precision -> LogisticRegression",
+        "Gray-zone exclusion: |pMIC - cutoff| < 0.5 removed from classification training only",
     ])
 
-    H(doc, "2.7 Classification cutoff selection", 2)
+    H(doc, "2.8 Classification cutoff and model-selection metric", 2)
     P(doc,
-      "Binary Active labels were compared at pMIC ≥ 5.5 and ≥ 6.0 (cutoff 7 was discarded "
-      "a priori because of extreme imbalance). Selection used GroupKFold random-forest probes "
-      "and preferred 6.0 when it was best among near-AUC candidates.")
+      "Binary Active labels were compared at pMIC >= 5.5 and >= 6.0 using GroupKFold "
+      "random-forest probes (cutoff 7 excluded a priori). Cutoff 6.0 was selected among "
+      "near-AUC candidates (soft preference for 6.0). A three-class probe "
+      "(Inactive < 5 / Moderate 5-6 / Active >= 6) was reported but did not replace the binary task.")
+    P(doc,
+      "Classifiers were ranked by GroupKFold out-of-fold Average Precision (PR-AUC). "
+      "AP measures ranking of the minority active class under imbalance and matches the "
+      "screening goal of recovering actives. ROC-AUC and F1 were reported but were not "
+      "used for model selection. Test metrics were not used to pick the model.")
 
-    H(doc, "2.8 Cascade: classify then active-only regress", 2)
+    H(doc, "2.9 OOF decision-threshold optimization", 2)
     P(doc,
-      "The global regressor ranks the full potency range but can miscalibrate among strong "
-      "actives. A cascade was therefore fit on the unique-molecule Butina split with no "
-      "test leakage:")
+      "After the best classifier was chosen by CV AP, the decision threshold on P(active) "
+      "was optimized by maximizing balanced accuracy on that model's OOF probabilities "
+      "(grid 0.05-0.95). The threshold was then frozen and applied to Train hard labels "
+      "for reporting, to Test evaluation and plots, to External validation, to sensitivity "
+      "sets, and to library screens. Test labels were not used to choose the threshold.")
+
+    H(doc, "2.10 Applicability domain", 2)
+    P(doc,
+      "Williams plots used StandardScaler + PCA (up to 50 components) fitted on training "
+      "selected features only. Leverage used the hat matrix with h* = 3(p+1)/n_train. "
+      "Labeled compounds were in-AD if h <= h* and |standardized residual| <= 3. External "
+      "points were overlaid on Train/Test Williams plots. Full library AD-coverage bars "
+      "from the previous Smiles.xlsx run were not recomputed in this execution.")
+
+    H(doc, "2.11 Signed fingerprint mapping", 2)
+    P(doc,
+      "TreeSHAP on the regression LightGBM surrogate ranked Morgan/MACCS bits globally. "
+      "For each of the five test molecules with highest predicted pMIC, per-molecule SHAP "
+      "was computed and the top bits were drawn individually: green = positive contribution "
+      "(increases predicted pMIC), red = negative. The same per-bit signed mapping was "
+      "repeated for classification (P_active) on the five test molecules with highest "
+      "active probability. Overlay drawings of reference TB drugs used the global top bits.")
+
+    H(doc, "2.12 External validation, sensitivity, and screening", 2)
+    P(doc,
+      "The frozen Stacking regressor and LightGBM classifier were applied to the "
+      "median-deduplicated external set. Canonical SMILES overlap with the modeling set "
+      "was reported; metrics were also computed after dropping the overlapping molecules.")
+    P(doc,
+      "Sensitivity analysis scored H37Rv and Resistant with the same frozen models. "
+      "Because H37Rv is nested inside AllStrainsExceptResistant, metrics were split into "
+      "all / overlap with modeling / overlap with Train / held-out versus Train. "
+      "Resistant has a true held-out subset versus the modeling set.")
+    P(doc,
+      "Approved, 4FDN, and CyanoMetDB were predicted in batch. Active_predicted used the "
+      "frozen OOF threshold (0.050), not 0.5. Invalid SMILES were skipped.")
+
+    H(doc, "2.13 Software", 2)
     bullets(doc, [
-        "Stage A: reuse the train-only classifier (pMIC ≥ 6); decision threshold from "
-        "balanced accuracy on train probabilities.",
-        "Stage B: fit a new regressor only on train ∩ true actives (n = 2,258); feature "
-        "selection refit on that subset; GroupKFold by Butina cluster among actives.",
-        "Test metrics reported separately as: (i) Oracle — active-regressor on true "
-        "test actives; (ii) Pipeline — active-regressor on classifier-predicted actives; "
-        "(iii) Baseline — global regressor for reference; (iv) true-positive subset.",
-    ])
-
-    H(doc, "2.9 Applicability domain", 2)
-    P(doc,
-      "Williams plots were computed in the selected feature space after StandardScaler and "
-      "PCA (≤50 components) fitted on training data only. Leverage used the hat matrix in "
-      "that PCA space with warning leverage h* = 3(p+1)/n_train. Standardized residuals used "
-      "the training residual standard deviation. For labeled sets (Train, Test, External) a "
-      "compound was in-AD if h ≤ h* and |standardized residual| ≤ 3. Unlabeled screening "
-      "libraries have no experimental pMIC, so in-AD was leverage-only (h ≤ h*). Coverage "
-      "was reported as a percentage of valid molecules. Williams scatter shows Train, Test, "
-      "and External only; library coverage is summarized as bars (COCONUT is too large to scatter).")
-
-    H(doc, "2.10 Interpretability", 2)
-    P(doc,
-      "TreeSHAP attributions on the regression LightGBM surrogate ranked Morgan/MACCS bits. "
-      "Top bits were mapped to atoms and highlighted on the five test compounds with highest "
-      "predicted pMIC and on reference TB drugs (SMILES for mapping.xlsx).")
-
-    H(doc, "2.11 External validation and screening", 2)
-    P(doc,
-      "Saved models were applied to the canonicalized external set and to three screening "
-      "libraries (approved, 4FDN, CyanoMetDB). Original columns were retained; predictions "
-      "were written to new *_pmic files. COCONUT was scored for AD coverage (738,820 valid "
-      "structures); a prior full pMIC screen of the same dump remains available as CSV.")
-
-    H(doc, "2.12 Software", 2)
-    bullets(doc, [
-        "Python 3.13; RDKit; scikit-learn; XGBoost; LightGBM; SHAP; NumPy; Pandas; Matplotlib",
-        "Key scripts: pmic_prediction.py, pmic_extras.py, cascade_cls_then_reg.py, "
-        "plot_ad_coverage.py, predict_forxlsx.py",
+        "Python; RDKit; scikit-learn; XGBoost; LightGBM; SHAP; NumPy; Pandas; Matplotlib",
+        "Key scripts: pmic_prediction.py, pmic_extras.py, predict_forxlsx.py",
+        "Log: pipeline_allstrains.log; cache: cache_features_allstrains.joblib",
     ])
 
     # ── 3 Results ───────────────────────────────────────────────────────────
     H(doc, "3. Results", 1)
 
-    H(doc, "3.1 Dataset after canonical SMILES", 2)
+    H(doc, "3.1 Deduplication", 2)
     table(doc,
-          ["Set", "Raw rows", "Invalid SMILES", "Unique molecules", "Duplicates removed",
-           "Conflicting pMIC groups"],
+          ["Set", "Raw rows with pMIC", "Exact dups removed", "Exact conflict pMIC groups",
+           "Canonical dups removed", "Unique molecules"],
           [
-              ["Modeling (Smiles.xlsx)", "35,948", "0", "19,183", "16,765", "4,204"],
-              ["External validation", "122", "0", "92", "30", "3"],
+              ["AllStrainsExceptResistant (main)", "29,065", "10,147", "3,014", "0", "18,918"],
+              ["External validation", "122", "30", "3", "0", "92"],
+              ["H37Rv (sensitivity)", "21,022", "5,361", "1,959", "0", "15,661"],
+              ["Resistant (sensitivity)", "6,798", "4,403", "727", "0", "2,395"],
           ])
-    P(doc, "Table 1. Canonical SMILES duplicate collapse (mean pMIC within each unique molecule).",
-      italic=True, size=10)
-    P(doc,
-      "Without this step the same chemical could have been treated as two compounds. "
-      "The unique-molecule modeling set (n = 19,183) is the basis of all subsequent results.")
-
-    H(doc, "3.2 Cutoff comparison (5.5 vs 6.0)", 2)
-    table(doc,
-          ["Cutoff", "Train active %", "CV ROC-AUC", "CV BalAcc", "CV F1", "CV MCC",
-           "Ext. actives (unique)"],
-          [
-              ["5.5", "28.0%", "0.828", "0.704", "0.577", "0.487", "25/92 (27.2%)"],
-              ["6.0 (selected)", "14.7%", "0.858", "0.686", "0.510", "0.474", "7/92 (7.6%)"],
-          ])
-    P(doc, "Table 2. Classification cutoff comparison on the unique-molecule train set "
-           "(GroupKFold RF probes). Cutoff 6.0 was selected for higher CV AUC.",
-      italic=True, size=10)
-    P(doc,
-      "A three-class probe (Inactive < 5 / Moderate 5–6 / Active ≥ 6) gave CV macro-F1 = 0.585 "
-      "and Test macro-F1 = 0.568; binary classification at pMIC ≥ 6 remained the primary task.")
-
-    H(doc, "3.3 Regression (global model, Butina split)", 2)
-    P(doc,
-      "After variance (4,949 features), correlation (4,896), and mutual-information selection "
-      "(top 1,000), Stacking of LightGBM + XGBoost + ExtraTrees → Ridge was best by CV R². "
-      "LightGBM was the strongest base learner on Test R². Train pMIC mean = 5.00 "
-      "(SD 0.95; range 2.17–9.00).")
-    table(doc,
-          ["Set", "R²", "RMSE", "MAE"],
-          [
-              ["Train", "0.920", "0.270", "0.201"],
-              ["CV (OOF)", "0.431", "0.719", "0.551"],
-              ["Test", "0.432", "0.714", "0.532"],
-          ])
-    P(doc, "Table 3. Global regression metrics — Stacking (selected by CV R²).", italic=True, size=10)
+    P(doc, "Table 1. Two-stage SMILES collapse with median pMIC.", italic=True, size=10)
 
     table(doc,
-          ["Model", "CV R²", "Test R²", "CV RMSE", "Test RMSE"],
+          ["Pair", "Intersection", "Percent of the second set"],
           [
-              ["RandomForest", "0.383", "0.384", "0.748", "0.744"],
-              ["ExtraTrees", "0.396", "0.396", "0.740", "0.736"],
-              ["HistGradBoost", "0.396", "0.374", "0.740", "0.750"],
-              ["Ridge", "0.156", "0.131", "0.875", "0.883"],
-              ["LinearSVR", "0.097", "0.077", "0.905", "0.910"],
-              ["XGBoost", "0.407", "0.396", "0.733", "0.736"],
-              ["LightGBM", "0.423", "0.429", "0.724", "0.716"],
-              ["Stacking (selected)", "0.431", "0.432", "0.719", "0.714"],
+              ["Modeling ∩ External", "2 / 92", "2.2%"],
+              ["Modeling ∩ H37Rv", "15,661 / 15,661", "100% (H37Rv is nested)"],
+              ["Modeling ∩ Resistant", "2,039 / 2,395", "85.1%"],
           ])
-    P(doc, "Table 4. Global regression model comparison on the unique-molecule Butina split.",
+    P(doc, "Table 2. Canonical SMILES overlap with the unique modeling set.", italic=True, size=10)
+
+    H(doc, "3.2 pMIC distribution before the split", 2)
+    P(doc,
+      "On 18,918 unique modeling molecules, 2,832 (15.0%) had pMIC >= 6 and 16,086 were "
+      "inactive at that cutoff. This is moderate-to-strong imbalance and motivated AP-based "
+      "model selection and OOF threshold calibration rather than SMOTE.")
+    fig(doc, PLOTS / "pmic_distribution.png",
+        "Figure 1. pMIC distribution on AllStrainsExceptResistant after median dedup, "
+        "before the train/test split (cutoff = 6).")
+
+    H(doc, "3.3 Cutoff comparison (5.5 vs 6.0)", 2)
+    table(doc,
+          ["Cutoff", "Train active %", "CV ROC-AUC", "CV AP", "CV BalAcc", "CV F1", "CV MCC"],
+          [
+              ["5.5", "29.5%", "0.826", "0.711", "0.710", "0.592", "0.478"],
+              ["6.0 (selected)", "16.2%", "0.863", "0.633", "0.706", "0.547", "0.496"],
+          ])
+    P(doc, "Table 3. GroupKFold RF probes on the unique-molecule train set. Cutoff 6.0 was selected.",
       italic=True, size=10)
+    P(doc,
+      "Three-class probe train counts Inactive/Moderate/Active = 7,921 / 4,757 / 2,456; "
+      "CV macro-F1 = 0.588; Test macro-F1 = 0.561. Binary classification at pMIC >= 6 "
+      "remained the primary task.")
+
+    H(doc, "3.4 Regression (global model, Butina split)", 2)
+    P(doc,
+      "After variance (4,977 features), correlation (4,922), and mutual-information selection "
+      "(top 1,000), Stacking of LightGBM + XGBoost + ExtraTrees -> Ridge was best by CV R2. "
+      "Train pMIC mean = 5.03 (SD 0.98; range 2.17-9.50).")
+    table(doc,
+          ["Set", "R2", "RMSE", "MAE"],
+          [
+              ["Train", "0.928", "0.263", "0.196"],
+              ["CV (OOF)", "0.441", "0.733", "0.561"],
+              ["Test", "0.412", "0.710", "0.530"],
+          ])
+    P(doc, "Table 4. Global regression metrics — Stacking (selected by CV R2).", italic=True, size=10)
+
+    table(doc,
+          ["Model", "CV R2", "Test R2", "CV RMSE", "Test RMSE"],
+          [
+              ["RandomForest", "0.393", "0.364", "0.765", "0.739"],
+              ["ExtraTrees", "0.404", "0.385", "0.758", "0.727"],
+              ["HistGradBoost", "0.398", "0.351", "0.761", "0.747"],
+              ["Ridge", "0.164", "0.086", "0.897", "0.886"],
+              ["LinearSVR", "0.137", "0.031", "0.911", "0.912"],
+              ["XGBoost", "0.415", "0.368", "0.750", "0.737"],
+              ["LightGBM", "0.434", "0.401", "0.738", "0.717"],
+              ["Stacking (selected)", "0.441", "0.412", "0.733", "0.710"],
+          ])
+    P(doc, "Table 5. Regression model comparison on the AllStrains Butina split.", italic=True, size=10)
 
     for name, cap in [
-        ("reg_00_model_comparison.png", "Figure 1. Regression model comparison (CV vs Test R²)."),
-        ("reg_01_distribution.png", "Figure 2. pMIC / MIC distributions."),
-        ("reg_02_pred_vs_exp.png", "Figure 3. Predicted vs experimental pMIC."),
-        ("reg_03_residuals.png", "Figure 4. Residual plots."),
-        ("reg_04_error_distribution.png", "Figure 5. Error distributions."),
-        ("reg_05_metrics_summary.png", "Figure 6. Regression metrics summary."),
-        ("reg_06_cv_performance.png", "Figure 7. Per-fold CV regression metrics."),
-        ("reg_07_embedding.png", "Figure 8. Chemical-space embeddings (regression)."),
-        ("reg_08_shap_summary.png", "Figure 9. Regression SHAP summary."),
-        ("reg_09_feature_importance.png", "Figure 10. Regression feature importance."),
-        ("reg_10_shap_dependence.png", "Figure 11. Regression SHAP dependence."),
-        ("reg_11_y_randomization.png", "Figure 12. Y-randomization (regression)."),
+        ("reg_00_model_comparison.png", "Figure 2. Regression model comparison (CV vs Test R2)."),
+        ("reg_01_distribution.png", "Figure 3. Train/Test pMIC and MIC distributions."),
+        ("reg_02_pred_vs_exp.png", "Figure 4. Predicted vs experimental pMIC."),
+        ("reg_03_residuals.png", "Figure 5. Residual plots."),
+        ("reg_04_error_distribution.png", "Figure 6. Error distributions."),
+        ("reg_05_metrics_summary.png", "Figure 7. Regression metrics summary."),
+        ("reg_06_cv_performance.png", "Figure 8. Per-fold CV regression metrics."),
+        ("reg_07_embedding.png", "Figure 9. Chemical-space embeddings (regression)."),
+        ("reg_08_shap_summary.png", "Figure 10. Regression SHAP summary."),
+        ("reg_09_feature_importance.png", "Figure 11. Regression feature importance."),
+        ("reg_10_shap_dependence.png", "Figure 12. Regression SHAP dependence."),
+        ("reg_11_y_randomization.png", "Figure 13. Y-randomization (regression)."),
         ("reg_12_williams_plot.png",
-         "Figure 13. Williams plot (regression AD) with Train, Test, and External; legend shows in-AD %."),
-        ("reg_13_rmse_comparison.png", "Figure 14. RMSE comparison across regressors."),
+         "Figure 14. Williams plot (regression AD) with Train, Test, and External."),
+        ("reg_13_rmse_comparison.png", "Figure 15. RMSE comparison across regressors."),
     ]:
         fig(doc, PLOTS / name, cap)
 
-    H(doc, "3.4 Classification (pMIC ≥ 6.0)", 2)
+    H(doc, "3.5 Classification (pMIC >= 6.0)", 2)
     P(doc,
-      "Gray-zone exclusion removed 3,169 train compounds with |pMIC − 6| < 0.5. "
-      "Classification training then used 12,177 compounds (1,125 active, 9.2%); the test "
-      "set retained 3,837 (405 active, 10.6%). Feature selection reduced the space to 300 "
-      "mutual-information features. Stacking (ExtraTrees + RandomForest + LightGBM → "
-      "LogisticRegression) achieved the best CV ROC-AUC (0.915). The saved decision "
-      "threshold (balanced accuracy on train probabilities) was 0.28. ExtraTrees was used "
-      "as the SHAP surrogate.")
+      "Gray-zone exclusion removed 3,206 train compounds with |pMIC - 6| < 0.5. "
+      "Classification training then used 11,928 compounds (1,263 active, 10.6%); the test "
+      "set retained 3,784 (376 active, 9.9%). Feature selection reduced the space to 300 "
+      "mutual-information features. LightGBM had the best CV Average Precision (0.751) and "
+      "was saved. Stacking CV AP was 0.742. ExtraTrees had a slightly higher Test AUC "
+      "(0.814) but was not selected, because selection used CV AP only.")
     table(doc,
-          ["Model", "CV AUC", "Test AUC", "CV F1", "Test F1"],
+          ["Model", "CV AP", "CV AUC", "Test AP", "Test AUC"],
           [
-              ["LinearSVM", "0.828", "0.711", "0.380", "0.321"],
-              ["LogisticReg", "0.828", "0.709", "0.399", "0.322"],
-              ["RandomForest", "0.913", "0.811", "0.521", "0.440"],
-              ["ExtraTrees", "0.915", "0.813", "0.578", "0.460"],
-              ["HistGradBoost", "0.897", "0.780", "0.521", "0.336"],
-              ["XGBoost", "0.906", "0.782", "0.555", "0.438"],
-              ["LightGBM", "0.909", "0.792", "0.624", "0.468"],
-              ["Stacking (saved)", "0.915", "0.816", "0.528", "0.407"],
+              ["LinearSVM", "0.498", "0.820", "0.285", "0.730"],
+              ["LogisticReg", "0.505", "0.822", "0.281", "0.733"],
+              ["RandomForest", "0.726", "0.913", "0.439", "0.800"],
+              ["ExtraTrees", "0.729", "0.914", "0.454", "0.814"],
+              ["HistGradBoost", "0.712", "0.899", "0.395", "0.764"],
+              ["XGBoost", "0.734", "0.909", "0.420", "0.779"],
+              ["LightGBM (selected)", "0.751", "0.911", "0.435", "0.784"],
+              ["Stacking", "0.742", "0.914", "0.454", "0.814"],
           ])
-    P(doc, "Table 5. Classification comparison at pMIC ≥ 6 on the unique-molecule split.",
+    P(doc, "Table 6. Classification comparison at pMIC >= 6. Best model selected by CV AP.",
       italic=True, size=10)
 
+    P(doc,
+      "OOF threshold optimization on LightGBM probabilities selected t = 0.050 (the lower "
+      "grid bound). For this class-weighted LightGBM, many inactive probabilities sit near "
+      "zero, so t = 0.050 still yielded Test specificity 0.945 and Test recall 0.426. "
+      "Ranking metrics (AUC/AP) are the primary quality measures for screening.")
+    fig(doc, PLOTS / "cls_00c_oof_threshold.png",
+        "Figure 16. OOF decision-threshold optimization (balanced accuracy and F1). "
+        "Selected t = 0.050 was frozen before Test evaluation.")
+
     table(doc,
-          ["Set", "Accuracy", "Bal. Acc.", "ROC-AUC", "F1", "MCC"],
+          ["Set", "Accuracy", "Bal. Acc.", "ROC-AUC", "Avg. Prec.", "F1", "Precision",
+           "Recall", "Specificity", "MCC"],
           [
-              ["Train", "0.949", "0.972", "1.000", "0.782", "0.779"],
-              ["CV (OOF)", "0.861", "0.853", "0.915", "0.528", "0.508"],
-              ["Test", "0.796", "0.737", "0.816", "0.407", "0.342"],
+              ["Train", "0.996", "0.998", "1.000", "1.000", "0.982", "0.964", "1.000", "0.996", "0.980"],
+              ["CV (OOF)", "0.918", "0.842", "0.911", "0.751", "0.659", "0.590", "0.745", "0.939", "0.618"],
+              ["Test", "0.894", "0.685", "0.784", "0.435", "0.443", "0.461", "0.426", "0.945", "0.384"],
           ])
-    P(doc, "Table 6. Detailed Stacking metrics at the balanced-accuracy threshold (0.28). "
-           "For screening, Active_probability ranking (AUC) is the primary quality metric.",
-      italic=True, size=10)
+    P(doc, "Table 7. LightGBM metrics at the frozen OOF threshold (0.050).", italic=True, size=10)
 
     for name, cap in [
-        ("cls_00_model_comparison.png", "Figure 15. Classification model comparison."),
-        ("cls_01_class_distribution.png", "Figure 16. Active/Inactive distributions."),
-        ("cls_02_roc_curve.png", "Figure 17. ROC curves."),
-        ("cls_03_pr_curve.png", "Figure 18. Precision–Recall curves."),
-        ("cls_04_confusion_matrix.png", "Figure 19. Confusion matrices."),
-        ("cls_05_metrics_summary.png", "Figure 20. Classification metrics summary."),
-        ("cls_06_cv_performance.png", "Figure 21. Per-fold CV classification metrics."),
-        ("cls_07_embedding.png", "Figure 22. Chemical-space embeddings (classification)."),
-        ("cls_08_shap_summary.png", "Figure 23. Classification SHAP summary."),
-        ("cls_09_feature_importance.png", "Figure 24. Classification feature importance."),
-        ("cls_10_shap_dependence.png", "Figure 25. Classification SHAP dependence."),
-        ("cls_11_y_randomization.png", "Figure 26. Y-randomization (classification)."),
-        ("cls_12_f1_comparison.png", "Figure 27. F1 comparison across classifiers."),
+        ("cls_00_model_comparison.png", "Figure 17. Classification model comparison (ROC-AUC)."),
+        ("cls_00b_model_comparison_ap.png", "Figure 18. Classification model comparison (Average Precision)."),
+        ("cls_01_class_distribution.png", "Figure 19. Active/Inactive distributions."),
+        ("cls_02_roc_curve.png", "Figure 20. ROC curves."),
+        ("cls_03_pr_curve.png", "Figure 21. Precision-Recall curves."),
+        ("cls_04_confusion_matrix.png", "Figure 22. Confusion matrices."),
+        ("cls_05_metrics_summary.png", "Figure 23. Classification metrics summary."),
+        ("cls_06_cv_performance.png", "Figure 24. Per-fold CV classification metrics."),
+        ("cls_07_embedding.png", "Figure 25. Chemical-space embeddings (classification)."),
+        ("cls_08_shap_summary.png", "Figure 26. Classification SHAP summary."),
+        ("cls_09_feature_importance.png", "Figure 27. Classification feature importance."),
+        ("cls_10_shap_dependence.png", "Figure 28. Classification SHAP dependence."),
+        ("cls_11_y_randomization.png", "Figure 29. Y-randomization (classification)."),
+        ("cls_12_f1_comparison.png", "Figure 30. F1 comparison across classifiers."),
         ("cls_13_williams_plot.png",
-         "Figure 28. Williams plot (classification AD) with Train, Test, and External; legend shows in-AD %."),
+         "Figure 31. Williams plot (classification AD) with Train, Test, and External."),
     ]:
         fig(doc, PLOTS / name, cap)
 
-    H(doc, "3.5 Applicability domain coverage", 2)
+    H(doc, "3.6 Signed fingerprint highlights", 2)
     P(doc,
-      "Williams AD was evaluated for Train, Test, External, and four screening libraries. "
-      "Labeled sets used leverage plus residual; unlabeled libraries used leverage only. "
-      "Regression feature-space h* = 0.010; classification h* = 0.013.")
+      "Global regression SHAP fingerprint bits were led by maccs_86, maccs_107, maccs_119, "
+      "and morgan_715. Per-molecule drawings color atoms green when the bit increases "
+      "predicted pMIC and red when it decreases it. Classification SHAP (P_active) was "
+      "dominated by morgan_1088 and maccs_98.")
     table(doc,
-          ["Dataset", "n valid", "Reg. in-AD %", "Reg. criterion",
-           "Cls. in-AD %", "Cls. criterion"],
+          ["Rank", "Regression feature", "Mean |SHAP|", "Classification feature", "Mean |SHAP|"],
           [
-              ["Train", "15,346 / 12,177*", "98.2", "leverage+residual", "95.5", "leverage+residual"],
-              ["Test", "3,837", "78.8", "leverage+residual", "83.7", "leverage+residual"],
-              ["External", "92", "91.3", "leverage+residual", "78.3", "leverage+residual"],
-              ["Approved", "14,596", "98.7", "leverage", "95.2", "leverage"],
-              ["4FDN", "799", "100.0", "leverage", "99.8", "leverage"],
-              ["CyanoMetDB", "3,026", "96.5", "leverage", "94.8", "leverage"],
-              ["COCONUT", "738,820", "98.6", "leverage", "92.5", "leverage"],
+              ["1", "maccs_86", "0.0061", "morgan_1088", "0.1623"],
+              ["2", "maccs_107", "0.0058", "maccs_98", "0.0403"],
+              ["3", "maccs_119", "0.0058", "morgan_559", "0.0323"],
+              ["4", "morgan_715", "0.0049", "morgan_354", "0.0287"],
+              ["5", "morgan_1152", "0.0040", "morgan_716", "0.0210"],
+              ["6", "maccs_95", "0.0038", "morgan_115", "0.0205"],
+              ["7", "maccs_110", "0.0027", "morgan_317", "0.0164"],
+              ["8", "maccs_111", "0.0026", "morgan_522", "0.0150"],
           ])
-    P(doc, "Table 7. Percent of molecules inside the applicability domain. "
-           "*Classification train n is after gray-zone exclusion. "
-           "Full numbers are in ad_coverage_summary.csv.",
+    P(doc, "Table 8. Top global SHAP fingerprint features (regression vs classification).",
       italic=True, size=10)
-    P(doc,
-      "Most screening compounds lie inside the leverage AD of the unique-molecule training "
-      "set. Test coverage is lower than train (78.8% regression / 83.7% classification), "
-      "as expected for a Butina split that holds out dissimilar clusters. External coverage "
-      "is high in regression space (91.3%) and moderate in classification space (78.3%).")
-    fig(doc, PLOTS / "ad_dataset_coverage.png",
-        "Figure 29. Regression AD: Williams scatter (Train/Test/External) and % in-AD bars "
-        "for all datasets including COCONUT.")
-    fig(doc, PLOTS / "cls_ad_dataset_coverage.png",
-        "Figure 30. Classification AD: Williams scatter and % in-AD bars for all datasets.")
-
-    H(doc, "3.6 Fingerprint highlights", 2)
-    P(doc,
-      "Top SHAP fingerprint bits from the regression LightGBM surrogate were led by "
-      "morgan_1928, maccs_86, and maccs_107. These bits were highlighted on the five test "
-      "molecules with highest predicted pMIC and on reference antimycobacterials.")
-    table(doc,
-          ["Rank", "Feature", "Type", "Mean |SHAP|"],
-          [
-              ["1", "morgan_1928", "Morgan", "0.0212"],
-              ["2", "maccs_86", "MACCS", "0.0133"],
-              ["3", "maccs_107", "MACCS", "0.0125"],
-              ["4", "morgan_80", "Morgan", "0.0050"],
-              ["5", "maccs_113", "MACCS", "0.0025"],
-              ["6", "maccs_119", "MACCS", "0.0025"],
-              ["7", "morgan_715", "Morgan", "0.0024"],
-              ["8", "maccs_89", "MACCS", "0.0023"],
-          ])
-    P(doc, "Table 8. Top regression SHAP fingerprint features.", italic=True, size=10)
 
     for name, cap in [
-        ("test_top1_score_7p37.png", "Figure 31. Test top-1 by predicted pMIC — FP highlights."),
-        ("test_top2_score_7p37.png", "Figure 32. Test top-2 — FP highlights."),
-        ("test_top3_score_7p36.png", "Figure 33. Test top-3 — FP highlights."),
-        ("test_top4_score_7p32.png", "Figure 34. Test top-4 — FP highlights."),
-        ("test_top5_score_7p32.png", "Figure 35. Test top-5 — FP highlights."),
-        ("map_Isoniazid.png", "Figure 36. Isoniazid — FP highlights."),
-        ("map_Rifampin.png", "Figure 37. Rifampin — FP highlights."),
-        ("map_Pyrazinamide.png", "Figure 38. Pyrazinamide — FP highlights."),
-        ("map_Ethambutol.png", "Figure 39. Ethambutol — FP highlights."),
-        ("map_Bedaquiline.png", "Figure 40. Bedaquiline — FP highlights."),
-        ("map_Delamanid.png", "Figure 41. Delamanid — FP highlights."),
-        ("map_Pretomanid.png", "Figure 42. Pretomanid — FP highlights."),
-        ("map_Linezolid.png", "Figure 43. Linezolid — FP highlights."),
+        ("test_top1_pMIC_8p42.png",
+         "Figure 32. Test top-1 by predicted pMIC — overlay of signed SHAP bits (green +, red -)."),
+        ("test_top2_pMIC_8p08.png", "Figure 33. Test top-2 — signed SHAP overlay."),
+        ("test_top3_pMIC_7p74.png", "Figure 34. Test top-3 — signed SHAP overlay."),
+        ("test_top4_pMIC_7p61.png", "Figure 35. Test top-4 — signed SHAP overlay."),
+        ("test_top5_pMIC_7p50.png", "Figure 36. Test top-5 — signed SHAP overlay."),
     ]:
         fig(doc, FP_REG / name, cap, width=5.2)
 
+    P(doc,
+      "Individual bits for the top-1 test molecule (all positive on this structure) and one "
+      "negative contribution from top-2 (maccs_109) are shown below. The full per-bit catalog "
+      "is plots/fp_highlights/per_bit_signed_shap.csv and the test_top*_bits folders.")
+    for name, cap in [
+        ("test_top1_bits/01_maccs_83_pos.png",
+         "Figure 37. Test top-1, bit maccs_83 — positive contribution to predicted pMIC."),
+        ("test_top1_bits/03_maccs_119_pos.png",
+         "Figure 38. Test top-1, bit maccs_119 — positive contribution."),
+        ("test_top1_bits/04_maccs_107_pos.png",
+         "Figure 39. Test top-1, bit maccs_107 — positive contribution."),
+        ("test_top1_bits/08_morgan_1160_pos.png",
+         "Figure 40. Test top-1, bit morgan_1160 — positive contribution."),
+        ("test_top2_bits/03_maccs_109_neg.png",
+         "Figure 41. Test top-2, bit maccs_109 — negative contribution (decreases predicted pMIC)."),
+        ("test_top4_bits/08_morgan_1152_neg.png",
+         "Figure 42. Test top-4, bit morgan_1152 — negative contribution."),
+    ]:
+        fig(doc, FP_REG / name, cap, width=5.0)
+
+    for name, cap in [
+        ("map_Isoniazid.png", "Figure 43. Isoniazid — global FP overlay."),
+        ("map_Rifampin.png", "Figure 44. Rifampin — global FP overlay."),
+        ("map_Bedaquiline.png", "Figure 45. Bedaquiline — global FP overlay."),
+        ("map_Delamanid.png", "Figure 46. Delamanid — global FP overlay."),
+        ("map_Linezolid.png", "Figure 47. Linezolid — global FP overlay."),
+    ]:
+        fig(doc, FP_REG / name, cap, width=5.0)
+
+    P(doc, "Classification per-bit examples (P_active SHAP, green increases active probability):")
+    for name, cap in [
+        ("test_top1_Pactive_1p00.png",
+         "Figure 48. Classification overlay on the highest-P(active) test molecule."),
+        ("test_top1_bits/01_maccs_98_pos.png",
+         "Figure 49. Classification bit maccs_98 — positive contribution to P(active)."),
+        ("test_top1_bits/03_morgan_1088_neg.png",
+         "Figure 50. Classification bit morgan_1088 — negative contribution to P(active) on this molecule."),
+    ]:
+        fig(doc, FP_CLS / name, cap, width=5.0)
+
     H(doc, "3.7 External validation", 2)
     P(doc,
-      "On the canonicalized external set (n = 92 unique molecules; 7 actives at pMIC ≥ 6) "
-      "the global regressor achieved R² = 0.718, RMSE = 0.455, MAE = 0.358. Classification "
-      "at cutoff 6.0 yielded ROC-AUC = 0.923, balanced accuracy = 0.918, F1 = 0.500, and "
-      "MCC = 0.528. These metrics are consistent with the high regression AD coverage of "
-      "this set (91.3%).")
+      "On 92 unique external molecules (7 actives at pMIC >= 6) the global regressor reached "
+      "R2 = 0.596, RMSE = 0.540, MAE = 0.436. Classification at cutoff 6.0 and frozen "
+      "threshold 0.050 gave ROC-AUC = 0.897, AP = 0.303, balanced accuracy = 0.798, "
+      "F1 = 0.455, MCC = 0.428. Two external molecules (2.2%) shared canonical SMILES with "
+      "the modeling set. Held-out-only metrics on the remaining 90 molecules were essentially "
+      "unchanged (R2 = 0.598, AUC = 0.895, AP = 0.303).")
     table(doc,
-          ["Task", "Metric", "Value"],
+          ["Subset", "n", "R2", "RMSE", "MAE", "ROC-AUC", "AP", "BalAcc", "F1"],
           [
-              ["Regression (global)", "n / R² / RMSE / MAE", "92 / 0.718 / 0.455 / 0.358"],
-              ["Classification (T=6)", "AUC / BalAcc / F1 / MCC", "0.923 / 0.918 / 0.500 / 0.528"],
-              ["External actives at T=6", "n (%)", "7 / 92 (7.6%)"],
-              ["Regression AD coverage", "in-AD %", "91.3"],
-              ["Classification AD coverage", "in-AD %", "78.3"],
+              ["All unique External", "92", "0.596", "0.540", "0.436", "0.897", "0.303", "0.798", "0.455"],
+              ["Held-out vs modeling", "90", "0.598", "0.545", "0.441", "0.895", "0.303", "0.797", "0.455"],
           ])
-    P(doc, "Table 9. External validation summary after canonical SMILES deduplication.",
-      italic=True, size=10)
+    P(doc, "Table 9. External validation with the frozen AllStrains models.", italic=True, size=10)
     fig(doc, PLOTS / "external_01_pred_vs_exp.png",
-        "Figure 44. External validation — predicted vs experimental pMIC (n = 92 unique molecules).")
+        "Figure 51. External validation — predicted vs experimental pMIC (n = 92 unique molecules).")
 
-    H(doc, "3.8 Cascade classification → active-only regression", 2)
+    H(doc, "3.8 Sensitivity analysis (frozen main model)", 2)
     P(doc,
-      "The cascade was re-fit on the unique-molecule split. Stage A reused the saved "
-      "classifier (Test AUC = 0.816; 981 predicted actives vs 405 true actives). Stage B "
-      "trained an active-only regressor on 2,258 train actives (mean pMIC = 6.62). "
-      "XGBoost was best by CV R² (0.223). The global regressor still ranked the full test "
-      "set (R² = 0.432) but failed among true actives (R² = −3.85, RMSE = 1.32). The "
-      "active-only model recovered usable potency on true test actives (Oracle R² = 0.181, "
-      "RMSE = 0.543). Pipeline metrics on predicted-actives are degraded by false positives, "
-      "as expected; among true positives (n = 282) R² = 0.200.")
-    table(doc,
-          ["Scenario", "n", "R²", "RMSE", "MAE"],
-          [
-              ["Baseline full-reg, all test", "3837", "0.432", "0.714", "0.532"],
-              ["Baseline full-reg, true actives", "405", "−3.853", "1.322", "1.074"],
-              ["Oracle active-reg (XGBoost), true actives", "405", "0.181", "0.543", "0.380"],
-              ["Pipeline active-reg, pred. actives", "981", "−1.072", "1.529", "1.277"],
-              ["Pipeline true positives only", "282", "0.200", "0.554", "0.397"],
-              ["Hybrid (inactive→5.5) all test", "3837", "−0.895", "1.304", "1.093"],
-          ])
-    P(doc, "Table 10. Cascade vs baseline regression on the unique-molecule Butina test set.",
-      italic=True, size=10)
-    fig(doc, PLOTS / "cascade_01_pred_vs_exp.png",
-        "Figure 45. Cascade vs baseline — predicted vs experimental pMIC (test).")
-    fig(doc, PLOTS / "cascade_02_r2_comparison.png",
-        "Figure 46. Cascade scenario R² comparison.")
+      "H37Rv unique molecules (n = 15,661) are entirely contained in AllStrainsExceptResistant. "
+      "Full-set H37Rv metrics are therefore optimistic. The chemically honest H37Rv number is "
+      "held-out versus Train (molecules that went to the Butina test split): n = 2,991, "
+      "R2 = 0.437, RMSE = 0.699, AUC = 0.808, AP = 0.482.")
     P(doc,
-      "On the unique external set, the global regressor on all 92 molecules remained strong "
-      "(R² = 0.718), but among the 7 true actives it failed (R² = −5.77, RMSE = 0.559). "
-      "Oracle active-only regression reduced RMSE to 0.214 (R² ≈ 0.01; n = 7 is too small "
-      "for a stable R²). Pipeline evaluation on 28 predicted actives was again limited by "
-      "false positives (R² = −1.67).")
+      "Resistant unique molecules (n = 2,395) overlap the modeling set at 85.1%. The 356 "
+      "molecules absent from modeling are the true sensitivity subset: R2 = 0.432, "
+      "RMSE = 0.825, AUC = 0.913, AP = 0.681.")
     table(doc,
-          ["External scenario", "n", "R²", "RMSE"],
+          ["Dataset", "Subset", "n", "n active", "R2", "RMSE", "ROC-AUC", "AP", "F1"],
           [
-              ["Baseline full-reg, all", "92", "0.718", "0.455"],
-              ["Baseline full-reg, true actives", "7", "−5.773", "0.559"],
-              ["Oracle active-reg, true actives", "7", "0.009", "0.214"],
-              ["Pipeline active-reg, pred. actives", "28", "−1.675", "0.880"],
+              ["H37Rv", "all (= overlap modeling)", "15,661", "2,476", "0.843", "0.390", "0.918", "0.816", "0.746"],
+              ["H37Rv", "overlap Train", "12,670", "2,169", "0.926", "0.270", "0.932", "0.851", "0.783"],
+              ["H37Rv", "held-out vs Train", "2,991", "307", "0.437", "0.699", "0.808", "0.482", "0.476"],
+              ["Resistant", "all", "2,395", "535", "0.530", "0.651", "0.817", "0.591", "0.585"],
+              ["Resistant", "overlap modeling", "2,039", "472", "0.546", "0.616", "0.798", "0.578", "0.583"],
+              ["Resistant", "held-out vs modeling", "356", "63", "0.432", "0.825", "0.913", "0.681", "0.597"],
+              ["Resistant", "held-out vs Train", "724", "118", "0.373", "0.785", "0.830", "0.552", "0.473"],
           ])
-    P(doc, "Table 11. Cascade external validation (canonical unique molecules).",
+    P(doc, "Table 10. Sensitivity analysis with the frozen AllStrains models (threshold 0.050).",
       italic=True, size=10)
+    fig(doc, PLOTS / "sens_H37Rv_pred_vs_exp.png",
+        "Figure 52. Sensitivity — H37Rv predicted vs experimental pMIC (orange = overlap with modeling).")
+    fig(doc, PLOTS / "sens_Resistant_pred_vs_exp.png",
+        "Figure 53. Sensitivity — Resistant predicted vs experimental pMIC "
+        "(blue = held-out vs modeling, n = 356).")
 
     H(doc, "3.9 Library screens", 2)
     table(doc,
-          ["Library", "Output", "Predicted", "Notes"],
+          ["Library", "Output", "Predicted", "Skipped", "Active at P >= 0.050"],
           [
-              ["Approved drugs", "approved_pmic.xlsx", "14,605", "875 skipped; 98.7% in regression AD"],
-              ["4FDN natural products", "4FDN-Natural-products-dock_pmic.xlsx", "1,923",
-               "5 skipped; 100% unique mols in regression AD (n=799 unique)"],
-              ["CyanoMetDB V03 2024", "CyanoMetDB_V03_2024_pmic.xlsx", "3,059",
-               "184 skipped; 96.5% in regression AD"],
-              ["COCONUT 07-2026", "coconut_csv-07-2026_pmic.csv", "738,820",
-               "AD scored in this run (98.6% in-AD); pMIC CSV from the prior screen"],
+              ["Approved drugs", "approved_pmic.xlsx", "14,605", "875", "833 (5.7%)"],
+              ["4FDN natural products", "4FDN-Natural-products-dock_pmic.xlsx", "1,923", "5", "7 (0.4%)"],
+              ["CyanoMetDB V03 2024", "CyanoMetDB_V03_2024_pmic.xlsx", "3,059", "184", "347 (11.3%)"],
           ])
-    P(doc, "Table 12. Virtual screening outputs. AD percentages refer to unique valid structures "
-           "in Table 7.", italic=True, size=10)
+    P(doc, "Table 11. Virtual screening with the frozen AllStrains models. "
+           "Active_predicted uses the OOF threshold 0.050. Rank by Active_probability / "
+           "pMIC_predicted for prioritization. COCONUT was not rescreened in this run.",
+      italic=True, size=10)
 
     # ── 4 Discussion ────────────────────────────────────────────────────────
     H(doc, "4. Discussion and limitations", 1)
     bullets(doc, [
-        "Canonical SMILES duplicate collapse halved the apparent sample (35,948 → 19,183) "
-        "and is a prerequisite for claiming that each training point is a distinct molecule. "
-        "Mean pMIC was used where replicate measurements disagreed (4,204 groups).",
-        "Butina/Tanimoto splitting is substantially harder than random split and better "
-        "reflects generalization to unseen chemotypes. After unique-molecule modeling, "
-        "Test R² rose to 0.43 versus ~0.32 on the previous non-deduplicated table.",
-        "Cutoff 6.0 is preferred over 5.5 for classification claims because of higher CV AUC, "
-        "despite fewer external actives (7 of 92).",
-        "Most screening compounds are inside the leverage AD, so domain shift is not the "
-        "main caveat for those libraries; Test and classification-space External coverage "
-        "are the stricter checks.",
-        "SHAP fingerprint highlights are correlative attributions, not causal proofs.",
-        "Classification Test F1 remains modest because of class imbalance; use probability "
-        "ranking (AUC 0.816 test / 0.923 external) for prioritization.",
-        "Global regression is useful for overall ranking but miscalibrates among strong "
-        "actives; cascade active-only regression (XGBoost) improves potency RMSE on true "
-        "actives (Oracle) and should be applied after classification in screening workflows. "
-        "Pipeline cascade metrics are sensitive to false positives—report Oracle and "
-        "Pipeline separately.",
+        "Exact-SMILES collapse was the dominant dedup step (10,147 rows on the main table). "
+        "3,014 groups had conflicting experimental pMIC under different conditions; median "
+        "aggregation avoids letting outlier assay rows dominate.",
+        "CV Average Precision is the appropriate classifier selection metric here: the "
+        "scientific goal is recovery of a 10-16% active class, not overall accuracy. "
+        "LightGBM (CV AP 0.751) was preferred over ExtraTrees/Stacking despite their "
+        "slightly higher Test AUC.",
+        "SMOTE was deliberately omitted. Fingerprint-space interpolation is not a valid "
+        "molecule. class_weight plus OOF threshold is the chemically safer remedy.",
+        "The OOF threshold of 0.050 sits at the search floor. It should be interpreted "
+        "together with ranking metrics; probability scores remain the screening currency.",
+        "H37Rv sensitivity on the full table is not an independent test (100% overlap). "
+        "Report held-out versus Train (R2 0.437, AUC 0.808) instead.",
+        "Resistant held-out versus modeling (n = 356, AUC 0.913, AP 0.681) is the strongest "
+        "evidence that the AllStrains model transfers to a distinct labeled collection.",
+        "External validation remains favorable (AUC 0.90) with only two overlapping molecules. "
+        "AP on External is lower (0.30) because only 7 of 92 compounds are active at cutoff 6.",
+        "Train classification metrics near 1.0 indicate overfitting of hard labels; OOF and "
+        "Test are the valid estimates.",
+        "SHAP bit maps are correlative attributions, not causal proofs of a pharmacophore. "
+        "Sign is molecule-specific: morgan_1088 can be negative on one structure and positive on another.",
+        "Cascade active-only regression was not retrained on this AllStrains split.",
+        "COCONUT and full-library AD-coverage bars were not recomputed in this execution.",
     ])
 
     H(doc, "5. Key deliverables", 1)
     bullets(doc, [
-        "cache_features_butina_canonical.joblib (unique-molecule features and Butina split)",
-        "best_reg_model.joblib / best_cls_model.joblib (T = 6)",
-        "best_reg_active_only_model.joblib / cascade_cls_reg_model.joblib",
-        "cascade_cls_reg_metrics.csv / cascade_test_predictions.xlsx / cascade_external_*",
-        "preprocessed_data.xlsx (n = 19,183; Split, roles, Butina_cluster)",
-        "plots/ including Williams overlays and ad_dataset_coverage.png / cls_ad_dataset_coverage.png",
-        "ad_coverage_summary.csv",
-        "external_validation_predictions.xlsx (n = 92)",
+        "cache_features_allstrains.joblib (features + Butina split)",
+        "best_reg_model.joblib / best_cls_model.joblib (T = 6, decision_threshold = 0.050, selection_metric = cv_average_precision)",
+        "preprocessed_data.xlsx (n = 18,918; Split, Dataset_role, Butina_cluster)",
+        "plots/pmic_distribution.png and plots/cls_00c_oof_threshold.png",
+        "plots/fp_highlights/ and plots/fp_highlights_cls/ (per-bit signed SHAP PNGs + CSVs)",
+        "external_validation_predictions.xlsx / external_validation_metrics.csv",
+        "sensitivity_H37Rv_predictions.xlsx / sensitivity_Resistant_predictions.xlsx / sensitivity_analysis_metrics.csv",
         "approved_pmic.xlsx, 4FDN-Natural-products-dock_pmic.xlsx, CyanoMetDB_V03_2024_pmic.xlsx",
-        "coconut_csv-07-2026_pmic.csv (prior screen; AD coverage computed in this run)",
+        "pipeline_allstrains.log",
     ])
 
     H(doc, "6. Conclusions", 1)
     P(doc,
-      "A scaffold-aware multi-fingerprint pipeline was established for antimycobacterial "
-      "pMIC modeling after canonical SMILES standardization and duplicate collapse "
-      "(n = 19,183 unique molecules). Under Butina splits, stacking regression reached "
-      "Test R² = 0.43 and classification at pMIC ≥ 6 achieved Test ROC-AUC = 0.82 with "
-      "strong external validation (R² = 0.72; AUC = 0.92 on 92 unique external molecules). "
-      "Williams AD analysis showed 91% of the external set and >92% of screening libraries "
-      "(including COCONUT) inside the leverage domain of the training chemistry, while the "
-      "held-out Butina test set was more challenging (79–84% in-AD). Cascade active-only "
-      "regression (XGBoost) improved potency RMSE among true test actives relative to the "
-      "global regressor (Oracle RMSE 0.54 vs 1.32) and is recommended as a second stage "
-      "after activity filtering. Fingerprint highlights and library screens provide "
-      "hypotheses for drug-repurposing prioritization.")
+      "The pipeline was retrained on AllStrainsExceptResistant after two-stage SMILES "
+      "deduplication with median pMIC (n = 18,918 unique molecules; 15.0% active at cutoff 6). "
+      "Under a Butina split, stacking regression reached Test R2 = 0.41. Classification "
+      "used CV Average Precision to select LightGBM (CV AP = 0.75; Test AUC = 0.78, Test AP = 0.44) "
+      "and a frozen OOF threshold of 0.050. External validation on 92 unique molecules remained "
+      "strong (R2 = 0.60; AUC = 0.90), with only two canonical overlaps. Sensitivity analysis "
+      "showed that H37Rv is nested in the modeling set, while 356 Resistant molecules are true "
+      "held-outs (AUC = 0.91). Approved, 4FDN, and CyanoMetDB were screened with the same "
+      "frozen models. Per-bit SHAP maps now show individual fingerprint bits with signed "
+      "positive or negative contribution.")
 
     end = doc.add_paragraph()
     end.alignment = WD_ALIGN_PARAGRAPH.CENTER
     r = end.add_run(
-        "\n— End of report —\n"
-        "Generated from pipeline v3 after canonical SMILES deduplication, "
-        "cascade retrain on the unique-molecule split, Williams AD coverage "
-        "(including COCONUT), and library screens."
+        "\n- End of report -\n"
+        "Generated from the AllStrainsExceptResistant execution "
+        "(pipeline_allstrains.log, 25 September 2026)."
     )
     r.italic = True
     r.font.size = Pt(9)

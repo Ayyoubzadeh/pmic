@@ -10,8 +10,9 @@ New vs v2:
   • Dataset_role labels: Train/CV-fold-k vs Test in preprocessed_data.xlsx
   • Highlight top Morgan/MACCS SHAP bits on top-5 test mols + mapping drugs
   • External validation (Cleaned_External_Validation.xlsx)
-  • Canonical SMILES + duplicate collapse (mean pMIC) before featurization
-  • Auto-screen approved / 4FDN / CyanoMetDB for repurposing candidates
+  • Two-stage SMILES dedup (exact then canonical) with median pMIC
+  • OOF decision-threshold optimization; classifiers ranked by CV AP
+  • Sensitivity analysis on H37Rv / Resistant; auto-screen repurposing libraries
 
 Install:
   pip install rdkit scikit-learn shap seaborn matplotlib pandas numpy umap-learn
@@ -100,8 +101,8 @@ warnings.filterwarnings("ignore")
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-DATA             = "Smiles.xlsx"
-PMIC_THRESHOLD   = 5.0
+DATA             = "AllStrainsExceptResistant.xlsx"
+PMIC_THRESHOLD   = 6.0
 RANDOM_STATE     = 42
 N_FOLDS          = 5
 TEST_SIZE        = 0.2
@@ -120,7 +121,8 @@ FEATURES_LIST     = "generated_features.txt"
 THRESHOLD_COMPARE = (5.5, 6.0)  # 7 excluded: too sparse; external often has no actives
 MAPPING_XLSX      = "SMILES for mapping.xlsx"
 EXTERNAL_XLSX     = "Cleaned_External_Validation.xlsx"
-FEATURE_CACHE     = "cache_features_butina_canonical.joblib"
+FEATURE_CACHE     = "cache_features_allstrains.joblib"
+SENSITIVITY_FILES = ["H37Rv.xlsx", "Resistant.xlsx"]
 REPURPOSE_FILES   = [
     "approved.xlsx",
     "4FDN-Natural-products-dock.xlsx",
@@ -273,6 +275,7 @@ from pmic_extras import (
     compare_pmic_thresholds, try_three_class,
     highlight_top_test_and_mapping, run_external_validation,
     canonicalize_and_dedup, load_labeled_smiles_table,
+    plot_pmic_distribution, report_canonical_overlap, run_sensitivity_analysis,
 )
 
 
@@ -338,10 +341,12 @@ def _reg_metrics(y_true, y_pred):
 def _cls_metrics(y_true, y_pred, y_proba):
     cm = confusion_matrix(y_true, y_pred)
     tn, fp, fn, tp = cm.ravel()
+    n_cls = len(np.unique(y_true))
     return {
         "Accuracy"    : accuracy_score(y_true, y_pred),
         "Bal. Acc."   : balanced_accuracy_score(y_true, y_pred),
-        "ROC-AUC"     : roc_auc_score(y_true, y_proba),
+        "ROC-AUC"     : roc_auc_score(y_true, y_proba) if n_cls > 1 else float("nan"),
+        "Avg. Prec."  : average_precision_score(y_true, y_proba) if n_cls > 1 else float("nan"),
         "F1"          : f1_score(y_true, y_pred, zero_division=0),
         "Precision"   : precision_score(y_true, y_pred, zero_division=0),
         "Recall/Sens.": tp / (tp + fn + 1e-12),
@@ -715,11 +720,29 @@ def tune_cls_optuna(name, X_tr, y_tr, n_trials, cv):
 # CLASSIFICATION: optimal decision threshold
 # ══════════════════════════════════════════════════════════════════════════════
 def optimal_threshold(y_true, y_proba):
-    """Find threshold maximising balanced accuracy on the given predictions."""
+    """Find threshold maximising balanced accuracy on OOF predictions (frozen for Test)."""
     thresholds = np.linspace(0.05, 0.95, 181)
     scores = [balanced_accuracy_score(y_true, (y_proba >= t).astype(int))
               for t in thresholds]
     return float(thresholds[np.argmax(scores)])
+
+
+def plot_oof_threshold_curve(y_true, y_proba, best_t, fname="cls_00c_oof_threshold"):
+    """Balanced accuracy and F1 vs decision threshold on OOF probabilities."""
+    thresholds = np.linspace(0.05, 0.95, 181)
+    bal = [balanced_accuracy_score(y_true, (y_proba >= t).astype(int)) for t in thresholds]
+    f1s = [f1_score(y_true, (y_proba >= t).astype(int), zero_division=0) for t in thresholds]
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    ax.plot(thresholds, bal, lw=2.2, label="Balanced accuracy (OOF)")
+    ax.plot(thresholds, f1s, lw=2.0, label="F1 (OOF)")
+    ax.axvline(best_t, color="black", ls="--", lw=1.6, label=f"selected t={best_t:.3f}")
+    ax.set_xlabel("Decision threshold (P_active)")
+    ax.set_ylabel("Score")
+    ax.set_title("OOF decision-threshold optimization", fontweight="bold")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    save_fig(fig, fname)
 
 
 def fit_leverage_ad(X_tr_f, random_state=RANDOM_STATE):
@@ -1164,6 +1187,8 @@ def run_regression(X, y, feat_names, tr_idx, te_idx, groups_tr, ext=None):
         "shap_values": sv,
         "feat_names_f": feat_names_f,
         "cv_fold_tr": cv_fold_labels(len(y_tr), cv_splits),
+        "shap_model": shap_model,
+        "X_te_f": X_te_f,
     }
     return trained[best_name], transform_fn, reg_info
 
@@ -1199,6 +1224,9 @@ def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr, ext=Non
     act_frac_te = y_te.mean()
     print(f"  Train: {len(y_tr)} (active={y_tr.sum()}, {act_frac_tr*100:.1f}%) | "
           f"Test: {len(y_te)} (active={y_te.sum()}, {act_frac_te*100:.1f}%)")
+    print("  [SMOTE] Not applied. Mixed Morgan/MACCS/descriptor interpolants are not "
+          "chemically valid fingerprints. class_weight='balanced' + OOF threshold "
+          "calibration is used instead. CV Average Precision ranks models on active recovery.")
     if min(act_frac_tr, 1 - act_frac_tr) < 0.1:
         print(f"  [WARN] Severe class imbalance — consider adjusting PMIC_THRESHOLD")
 
@@ -1208,10 +1236,14 @@ def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr, ext=Non
     models = build_cls_models(len(y_tr))
     cv_splits = make_group_cv(groups_clear, n_folds=N_FOLDS)
 
-    print(f"\n  {'Model':<20} {'CV AUC':>8}  {'Test AUC':>8}  {'CV F1':>8}  {'Test F1':>8}")
+    print("  [Select] Classifiers ranked by GroupKFold OOF Average Precision "
+          "(active ranking under imbalance). Test metrics are reported after "
+          "OOF threshold freeze and are not used for selection.")
+    print(f"\n  {'Model':<20} {'CV AP':>8}  {'CV AUC':>8}  {'Test AP':>8}  {'Test AUC':>8}")
     print(f"  {'-'*20} {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
 
     cv_auc  = {}; test_auc  = {}
+    cv_ap   = {}; test_ap   = {}
     cv_f1   = {}; test_f1   = {}
     cv_probas = {}; te_probas = {}
     trained   = {}
@@ -1222,28 +1254,30 @@ def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr, ext=Non
         te_p = model.predict_proba(X_te_f)[:, 1]
         cv_probas[name] = cv_p; te_probas[name] = te_p; trained[name] = model
 
-        # Use optimal threshold from CV predictions
+        # OOF threshold only (not Test) for the F1 numbers in this scan
         thresh = optimal_threshold(y_tr, cv_p)
         cv_pred  = (cv_p  >= thresh).astype(int)
         te_pred  = (te_p  >= thresh).astype(int)
 
         cv_auc[name]  = roc_auc_score(y_tr, cv_p)
         test_auc[name] = roc_auc_score(y_te, te_p)
+        cv_ap[name]   = average_precision_score(y_tr, cv_p)
+        test_ap[name] = average_precision_score(y_te, te_p)
         cv_f1[name]   = f1_score(y_tr, cv_pred, zero_division=0)
         test_f1[name] = f1_score(y_te, te_pred, zero_division=0)
-        print(f"  {name:<20} {cv_auc[name]:>8.4f}  {test_auc[name]:>8.4f}  "
-              f"{cv_f1[name]:>8.4f}  {test_f1[name]:>8.4f}")
+        print(f"  {name:<20} {cv_ap[name]:>8.4f}  {cv_auc[name]:>8.4f}  "
+              f"{test_ap[name]:>8.4f}  {test_auc[name]:>8.4f}")
 
     # ── optional Optuna tuning ────────────────────────────────────────────────
     if N_OPTUNA_TRIALS > 0 and HAS_OPTUNA:
-        best_base = max(cv_auc, key=cv_auc.get)
+        best_base = max(cv_ap, key=cv_ap.get)
         print(f"\n  [Optuna] Tuning {best_base} ({N_OPTUNA_TRIALS} trials)…")
         best_params = tune_cls_optuna(best_base, X_tr_f, y_tr, N_OPTUNA_TRIALS, cv_splits)
         print(f"  Best params: {best_params}")
 
     # ── stacking ──────────────────────────────────────────────────────────────
-    tree_names = [n for n in cv_auc if n not in ("LogisticReg", "LinearSVM")]
-    top3 = sorted(tree_names, key=lambda n: cv_auc[n], reverse=True)[:3]
+    tree_names = [n for n in cv_ap if n not in ("LogisticReg", "LinearSVM")]
+    top3 = sorted(tree_names, key=lambda n: cv_ap[n], reverse=True)[:3]
     print(f"\n  Building Stacking ({' + '.join(top3)}) → LogisticRegression …")
     stacking = StackingClassifier(
         estimators=[(n, build_cls_models(len(y_tr))[n]) for n in top3],
@@ -1264,20 +1298,27 @@ def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr, ext=Non
     stk_thresh = optimal_threshold(y_tr, stk_cv_p)
     cv_auc["Stacking"]   = roc_auc_score(y_tr, stk_cv_p)
     test_auc["Stacking"] = roc_auc_score(y_te, stk_te_p)
+    cv_ap["Stacking"]    = average_precision_score(y_tr, stk_cv_p)
+    test_ap["Stacking"]  = average_precision_score(y_te, stk_te_p)
     cv_f1["Stacking"]    = f1_score(y_tr, (stk_cv_p >= stk_thresh).astype(int), zero_division=0)
     test_f1["Stacking"]  = f1_score(y_te, (stk_te_p >= stk_thresh).astype(int), zero_division=0)
     cv_probas["Stacking"] = stk_cv_p; te_probas["Stacking"] = stk_te_p
     trained["Stacking"]   = stacking
-    print(f"  {'Stacking':<20} {cv_auc['Stacking']:>8.4f}  {test_auc['Stacking']:>8.4f}  "
-          f"{cv_f1['Stacking']:>8.4f}  {test_f1['Stacking']:>8.4f}")
+    print(f"  {'Stacking':<20} {cv_ap['Stacking']:>8.4f}  {cv_auc['Stacking']:>8.4f}  "
+          f"{test_ap['Stacking']:>8.4f}  {test_auc['Stacking']:>8.4f}")
 
-    # ── select best model for detailed analysis ───────────────────────────────
-    best_name  = max(cv_auc, key=cv_auc.get)
+    # ── select best model by CV AP, then freeze OOF threshold ─────────────────
+    best_name  = max(cv_ap, key=cv_ap.get)
     best_model = trained[best_name]
     y_cv_proba = cv_probas[best_name]
     y_te_proba = te_probas[best_name]
 
+    print(f"\n  [OOF threshold] Optimizing decision threshold on CV probabilities "
+          f"of {best_name} (Test unused) …")
     best_thresh  = optimal_threshold(y_tr, y_cv_proba)
+    plot_oof_threshold_curve(y_tr, y_cv_proba, best_thresh)
+    print(f"  Frozen decision threshold = {best_thresh:.3f}  "
+          f"(max balanced accuracy on OOF; applied to Test / External / screens)")
     y_tr_proba   = best_model.predict_proba(X_tr_f)[:, 1]
     y_tr_pred    = (y_tr_proba >= best_thresh).astype(int)
     y_cv_pred    = (y_cv_proba >= best_thresh).astype(int)
@@ -1289,15 +1330,18 @@ def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr, ext=Non
     print_metrics_table({"Train": m_train, "CV (OOF)": m_cv, "Test": m_test},
                         f"Classification Metrics — {best_name} (threshold={best_thresh:.2f})")
 
-    shap_name  = max((n for n in cv_auc if n not in ("LogisticReg", "LinearSVM", "Stacking")), key=lambda n: cv_auc[n])
+    shap_name  = max((n for n in cv_ap if n not in ("LogisticReg", "LinearSVM", "Stacking")), key=lambda n: cv_ap[n])
     shap_model = trained[shap_name]
-    print(f"  Best model (CV AUC): {best_name}  |  SHAP model: {shap_name}")
+    print(f"  Best model (CV AP): {best_name}  |  SHAP model: {shap_name}")
 
     # ── [00] model comparison ─────────────────────────────────────────────────
     print("[0/12] Model comparison")
     plot_model_comparison(cv_auc, test_auc, "ROC-AUC",
                           "Classification — Model Comparison (CV vs Test AUC)",
                           "cls_00_model_comparison")
+    plot_model_comparison(cv_ap, test_ap, "Average Precision",
+                          "Classification — Model Comparison (CV vs Test AP)",
+                          "cls_00b_model_comparison_ap")
 
     # ── [01] class distribution ───────────────────────────────────────────────
     print("[1/12] Active vs Inactive distribution")
@@ -1448,7 +1492,17 @@ def run_classification(X, y_pmic, feat_names, tr_idx, te_idx, groups_tr, ext=Non
         print(f"\nClassification Report — {name}:")
         print(classification_report(yt, yp, target_names=["Inactive", "Active"]))
 
-    return best_model, transform_fn
+    cls_info = {
+        "decision_threshold": float(best_thresh),
+        "best_name": best_name,
+        "shap_model": shap_model,
+        "X_te_f": X_te_f,
+        "y_te_proba": y_te_proba,
+        "y_te": y_te,
+        "feat_names_f": feat_names_f,
+        "shap_values": sv,
+    }
+    return best_model, transform_fn, cls_info
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1468,6 +1522,23 @@ def main():
 
     df = load_data(DATA)
     print(f"[Data] {len(df)} molecules  |  pMIC {df['pMIC'].min():.2f}–{df['pMIC'].max():.2f}")
+
+    plot_pmic_distribution(
+        df["pMIC"].values,
+        OUTPUT_DIR / "pmic_distribution.png",
+        cutoff=6.0,
+        label=Path(DATA).stem,
+    )
+    n_act6 = int((df["pMIC"] >= 6.0).sum())
+    frac6 = n_act6 / max(len(df), 1)
+    print(f"[Balance] pMIC≥6: {n_act6}/{len(df)} ({frac6*100:.1f}% active). "
+          "SMOTE skipped — see classification log for rationale.")
+
+    if Path(EXTERNAL_XLSX).exists():
+        ext_df0 = load_labeled_smiles_table(EXTERNAL_XLSX, label="External")
+        report_canonical_overlap(
+            df["SMILES"].tolist(), ext_df0["SMILES"].tolist(),
+            "modeling", "External")
 
     save_feature_list(build_feature_names())
 
@@ -1523,8 +1594,9 @@ def main():
 
     best_reg_model, reg_transform_fn, reg_info = run_regression(
         X, y, feat_names, tr_idx, te_idx, groups_tr, ext=ext_ad)
-    best_cls_model, cls_transform_fn = run_classification(
+    best_cls_model, cls_transform_fn, cls_info = run_classification(
         X, y, feat_names, tr_idx, te_idx, groups_tr, ext=ext_ad)
+    decision_threshold = float(cls_info["decision_threshold"])
 
     # ── Split labels for every molecule ───────────────────────────────────────
     split_labels = np.array(["Train"] * len(df_valid), dtype=object)
@@ -1540,15 +1612,27 @@ def main():
         cluster_ids=cluster_id,
     )
 
-    # ── FP SHAP highlights: top-5 test + TB drugs mapping ─────────────────────
-    print("\n[Highlight] Morgan/MACCS SHAP bits on top-5 test + mapping drugs …")
+    print("\n[Highlight] Per-bit signed SHAP (green +, red −) on top-5 test + mapping drugs …")
     smiles_te = [smiles_valid[i] for i in te_idx]
     highlight_top_test_and_mapping(
         smiles_te, reg_info["y_te_pred"], reg_info["y_te"],
         reg_info["shap_values"], reg_info["feat_names_f"],
         mapping_xlsx=MAPPING_XLSX,
         out_dir=str(OUTPUT_DIR / "fp_highlights"),
-        top_n_mols=5, top_n_feats=12, n_bits=2048,
+        top_n_mols=5, top_n_feats=8, n_bits=2048,
+        score_name="pMIC",
+        shap_model=reg_info.get("shap_model"),
+        X_test_f=reg_info.get("X_te_f"),
+    )
+    highlight_top_test_and_mapping(
+        smiles_te, cls_info["y_te_proba"], cls_info["y_te"].astype(float),
+        cls_info["shap_values"], cls_info["feat_names_f"],
+        mapping_xlsx=MAPPING_XLSX,
+        out_dir=str(OUTPUT_DIR / "fp_highlights_cls"),
+        top_n_mols=5, top_n_feats=8, n_bits=2048,
+        score_name="Pactive",
+        shap_model=cls_info.get("shap_model"),
+        X_test_f=cls_info.get("X_te_f"),
     )
 
     joblib.dump(
@@ -1558,26 +1642,46 @@ def main():
     print(f"  [saved] best_reg_model.joblib")
     joblib.dump(
         {"model": best_cls_model, "transform_fn": cls_transform_fn,
-         "pmic_threshold": PMIC_THRESHOLD, "butina_cutoff": BUTINA_DIST_CUTOFF},
+         "pmic_threshold": PMIC_THRESHOLD,
+         "decision_threshold": decision_threshold,
+         "butina_cutoff": BUTINA_DIST_CUTOFF,
+         "selection_metric": "cv_average_precision"},
         "best_cls_model.joblib")
-    print(f"  [saved] best_cls_model.joblib")
+    print(f"  [saved] best_cls_model.joblib  (decision_threshold={decision_threshold:.3f})")
 
     # ── External validation ───────────────────────────────────────────────────
     run_external_validation(
         best_reg_model, reg_transform_fn, best_cls_model, cls_transform_fn,
         smiles_to_features, PMIC_THRESHOLD,
         path=EXTERNAL_XLSX, out_dir=OUTPUT_DIR,
+        decision_threshold=decision_threshold,
+        modeling_smiles=smiles_valid,
+    )
+
+    # ── Sensitivity: frozen main model on H37Rv / Resistant ───────────────────
+    train_smiles = [smiles_valid[i] for i in tr_idx]
+    run_sensitivity_analysis(
+        SENSITIVITY_FILES,
+        train_smiles=train_smiles,
+        modeling_smiles=smiles_valid,
+        smiles_to_features_fn=smiles_to_features,
+        reg_model=best_reg_model, reg_transform=reg_transform_fn,
+        cls_model=best_cls_model, cls_transform=cls_transform_fn,
+        pmic_threshold=PMIC_THRESHOLD,
+        decision_threshold=decision_threshold,
+        out_dir=OUTPUT_DIR,
     )
 
     # ── Drug repurposing / NP candidate screens ───────────────────────────────
     print("\n[Repurpose] Screening external libraries …")
     try:
-        from predict_forxlsx import predict_file, load_models as _load_pred_models
-        # models already in memory — call predict_file with them
+        from predict_forxlsx import predict_file
         for f in REPURPOSE_FILES:
             if Path(f).exists():
                 predict_file(f, best_reg_model, reg_transform_fn,
-                             best_cls_model, cls_transform_fn)
+                             best_cls_model, cls_transform_fn,
+                             pmic_threshold=PMIC_THRESHOLD,
+                             decision_threshold=decision_threshold)
             else:
                 print(f"  [SKIP] {f} not found")
     except Exception as e:
@@ -1586,7 +1690,8 @@ def main():
     n_plots = len(list(OUTPUT_DIR.rglob("*.png")))
     print(f"\n{'='*60}")
     print(f"  {n_plots} plots saved → {OUTPUT_DIR.absolute()}")
-    print(f"  Active threshold used: pMIC ≥ {PMIC_THRESHOLD}")
+    print(f"  Active pMIC cutoff: ≥ {PMIC_THRESHOLD}")
+    print(f"  Decision threshold (OOF): {decision_threshold:.3f}")
     print("=" * 60)
 
 

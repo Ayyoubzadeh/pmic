@@ -56,7 +56,9 @@ def load_models():
     reg = joblib.load(REG_BUNDLE)
     print(f"[Load] {CLS_BUNDLE}")
     cls = joblib.load(CLS_BUNDLE)
-    return reg["model"], reg["transform_fn"], cls["model"], cls["transform_fn"]
+    dec = float(cls.get("decision_threshold", 0.5)) if isinstance(cls, dict) else 0.5
+    thr = float(cls.get("pmic_threshold", PMIC_THRESHOLD)) if isinstance(cls, dict) else PMIC_THRESHOLD
+    return reg["model"], reg["transform_fn"], cls["model"], cls["transform_fn"], thr, dec
 
 
 def load_coconut(filepath):
@@ -112,7 +114,8 @@ def main():
     print(f"  Threshold  : pMIC ≥ {PMIC_THRESHOLD} → Active")
     print("=" * 60)
 
-    reg_model, reg_transform, cls_model, cls_transform = load_models()
+    reg_model, reg_transform, cls_model, cls_transform, thr, dec = load_models()
+    print(f"  Using pMIC cutoff={thr:g}  |  decision threshold={dec:.3f}")
     df, meta_cols = load_coconut(INPUT_FILE)
 
     n = len(df)
@@ -148,7 +151,7 @@ def main():
         pred["pMIC_predicted"] = np.round(pmic, 4)
         pred["MIC_uM_predicted"] = np.round(10 ** (-pmic) * 1e6, 4)
         pred["Active_probability"] = np.round(proba, 4)
-        pred["Active_predicted"] = (proba >= 0.5).astype(int)
+        pred["Active_predicted"] = (proba >= dec).astype(int)
         pred["Active_label"] = pred["Active_predicted"].map(
             {1: "Active", 0: "Inactive"})
 

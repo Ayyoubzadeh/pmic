@@ -58,7 +58,8 @@ def load_models():
     print(f"[Load] {CLS_BUNDLE}")
     cls = joblib.load(CLS_BUNDLE)
     thr = float(cls.get("pmic_threshold", PMIC_THRESHOLD)) if isinstance(cls, dict) else PMIC_THRESHOLD
-    return reg["model"], reg["transform_fn"], cls["model"], cls["transform_fn"], thr
+    dec = float(cls.get("decision_threshold", 0.5)) if isinstance(cls, dict) else 0.5
+    return reg["model"], reg["transform_fn"], cls["model"], cls["transform_fn"], thr, dec
 
 
 def find_smiles_column(df):
@@ -70,13 +71,14 @@ def find_smiles_column(df):
 
 
 def predict_file(filepath, reg_model, reg_transform, cls_model, cls_transform,
-                 pmic_threshold=None):
+                 pmic_threshold=None, decision_threshold=0.5):
     path = Path(filepath)
     if not path.exists():
         print(f"[SKIP] {filepath} not found")
         return
 
     thr = PMIC_THRESHOLD if pmic_threshold is None else float(pmic_threshold)
+    dec = float(decision_threshold)
 
     print(f"\n{'=' * 60}")
     print(f"  {path.name}")
@@ -136,10 +138,11 @@ def predict_file(filepath, reg_model, reg_transform, cls_model, cls_transform,
     df["pMIC_predicted"] = np.round(pmic, 4)
     df["MIC_uM_predicted"] = np.round(10 ** (-pmic) * 1e6, 4)
     df["Active_probability"] = np.round(proba, 4)
-    active = np.where(np.isnan(proba), np.nan, (proba >= 0.5).astype(float))
+    active = np.where(np.isnan(proba), np.nan, (proba >= dec).astype(float))
     df["Active_predicted"] = active
     df["Active_label"] = pd.Series(active).map({1.0: "Active", 0.0: "Inactive"})
     df["Activity_cutoff_pMIC"] = thr
+    df["decision_threshold"] = dec
 
     if large or n > 100_000:
         out_path = path.with_name(f"{path.stem}_pmic.csv")
@@ -159,10 +162,10 @@ def predict_file(filepath, reg_model, reg_transform, cls_model, cls_transform,
           f"{int((~ok_mask).sum())} skipped (empty/invalid SMILES)")
     print(f"  Output: {out_path}")
     if ok_mask.any():
-        print(f"  Active (P>=0.5): {int((proba[ok_mask] >= 0.5).sum())}  "
-              f"({(proba[ok_mask] >= 0.5).mean()*100:.1f}%)")
+        print(f"  Active (P>={dec:.3f}): {int((proba[ok_mask] >= dec).sum())}  "
+              f"({(proba[ok_mask] >= dec).mean()*100:.1f}%)")
         print(f"  pMIC range: [{pmic[ok_mask].min():.3f}, {pmic[ok_mask].max():.3f}]")
-        print(f"  Model activity cutoff: pMIC ≥ {thr}")
+        print(f"  Model activity cutoff: pMIC ≥ {thr}  |  decision threshold={dec:.3f}")
 
 
 def main():
@@ -173,13 +176,13 @@ def main():
     print(f"  Inputs: {', '.join(files)}")
     print("=" * 60)
 
-    reg_model, reg_transform, cls_model, cls_transform, thr = load_models()
-    print(f"  Classifier trained at pMIC ≥ {thr}")
+    reg_model, reg_transform, cls_model, cls_transform, thr, dec = load_models()
+    print(f"  Classifier trained at pMIC ≥ {thr}  |  decision threshold={dec:.3f}")
     for f in files:
         if Path(f).name.lower().startswith("coconut"):
             print(f"\n[Info] {f} is large — using predict_coconut-style CSV output")
         predict_file(f, reg_model, reg_transform, cls_model, cls_transform,
-                     pmic_threshold=thr)
+                     pmic_threshold=thr, decision_threshold=dec)
 
     print(f"\n{'=' * 60}")
     print("  All outputs written.")

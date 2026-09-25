@@ -2,10 +2,10 @@
 """
 Extras for pMIC pipeline v3:
   • Butina (Tanimoto) cluster / scaffold-style split + GroupKFold groups
-  • Classification threshold comparison (pMIC 5 / 6 / 7)
-  • Fingerprint SHAP atom highlighting
-  • Canonical SMILES + duplicate collapse (mean pMIC) before featurization
-  • External validation helpers
+  • Classification threshold comparison (pMIC 5.5 / 6)
+  • Fingerprint SHAP atom highlighting (per-bit signed +/−)
+  • Two-stage SMILES dedup (exact string then canonical) with median pMIC
+  • External validation + sensitivity analysis helpers
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from sklearn.model_selection import GroupKFold, cross_val_predict
 from sklearn.metrics import (
     roc_auc_score, f1_score, balanced_accuracy_score, matthews_corrcoef,
     r2_score, mean_squared_error, mean_absolute_error,
-    accuracy_score, classification_report,
+    accuracy_score, classification_report, average_precision_score,
 )
 
 warnings.filterwarnings("ignore")
@@ -50,32 +50,55 @@ def canonical_smiles_of(smi):
         return None
 
 
-def canonicalize_and_dedup(df, smiles_col="SMILES", pmic_col="pMIC", label="Data"):
+def canonicalize_and_dedup(df, smiles_col="SMILES", pmic_col="pMIC", label="Data",
+                           pmic_agg="median"):
     """
-    Standardise SMILES to RDKit canonical form and collapse duplicate molecules
-    *before* fingerprint/descriptor construction.
+    Collapse duplicate molecules *before* fingerprint construction.
 
-    If ``pmic_col`` is present, pMIC is averaged; other columns keep the first row.
-    If ``pmic_col`` is None or missing, keep the first occurrence of each molecule.
+    1) Exact SMILES string (strip) — same row written twice / multi-condition assays.
+    2) RDKit canonical SMILES — same molecule with two different writings.
+
+    ``pmic_agg`` is 'median' (robust to outlier assay conditions) or 'mean'.
+    Other columns keep the first row. Unlabeled tables (no pMIC) keep first occurrence.
     """
     df = df.copy()
     n_raw = len(df)
     if smiles_col not in df.columns:
         raise ValueError(f"{label}: missing '{smiles_col}' column")
+    if pmic_agg not in ("median", "mean"):
+        raise ValueError("pmic_agg must be 'median' or 'mean'")
+
+    df["_smi_key"] = df[smiles_col].astype(str).str.strip()
+    has_pmic = pmic_col is not None and pmic_col in df.columns
+    if has_pmic:
+        df[pmic_col] = pd.to_numeric(df[pmic_col], errors="coerce")
+        df = df.dropna(subset=[pmic_col]).reset_index(drop=True)
+
+    n_exact_conflict = 0
+    n_before_exact = len(df)
+    if has_pmic:
+        n_exact_conflict = int((df.groupby("_smi_key", sort=False)[pmic_col].nunique() > 1).sum())
+        agg = {pmic_col: pmic_agg}
+        for c in df.columns:
+            if c in ("_smi_key", pmic_col, smiles_col):
+                continue
+            agg[c] = "first"
+        df = df.groupby("_smi_key", as_index=False, sort=False).agg(agg)
+        df[smiles_col] = df["_smi_key"]
+    else:
+        df = df.drop_duplicates(subset=["_smi_key"], keep="first")
+    n_exact_removed = n_before_exact - len(df)
+    df = df.drop(columns=["_smi_key"], errors="ignore")
 
     df["_canonical"] = [canonical_smiles_of(s) for s in df[smiles_col]]
     n_invalid = int(df["_canonical"].isna().sum())
     df = df.dropna(subset=["_canonical"]).reset_index(drop=True)
+    n_before_canon = len(df)
 
-    has_pmic = pmic_col is not None and pmic_col in df.columns
-    n_conflict = 0
+    n_canon_conflict = 0
     if has_pmic:
-        df[pmic_col] = pd.to_numeric(df[pmic_col], errors="coerce")
-        df = df.dropna(subset=[pmic_col]).reset_index(drop=True)
-    n_before = len(df)
-    if has_pmic:
-        n_conflict = int((df.groupby("_canonical", sort=False)[pmic_col].nunique() > 1).sum())
-        agg = {pmic_col: "mean"}
+        n_canon_conflict = int((df.groupby("_canonical", sort=False)[pmic_col].nunique() > 1).sum())
+        agg = {pmic_col: pmic_agg}
         for c in df.columns:
             if c in ("_canonical", pmic_col, smiles_col):
                 continue
@@ -85,12 +108,11 @@ def canonicalize_and_dedup(df, smiles_col="SMILES", pmic_col="pMIC", label="Data
         out = df.drop_duplicates(subset=["_canonical"], keep="first").copy()
         out = out.drop(columns=[smiles_col], errors="ignore")
 
-    n_dups = n_before - len(out)
-    msg = (f"[Canonical] {label}: raw={n_raw}  invalid={n_invalid}  "
-           f"unique={len(out)}  dups_removed={n_dups}")
-    if has_pmic:
-        msg += f"  conflicting_pMIC_groups={n_conflict}"
-    print(msg)
+    n_canon_removed = n_before_canon - len(out)
+    print(f"[Dedup/{pmic_agg}] {label}: raw={n_raw}  "
+          f"exact_dups_removed={n_exact_removed}  exact_conflict_pMIC={n_exact_conflict}  "
+          f"invalid={n_invalid}  canon_dups_removed={n_canon_removed}  "
+          f"canon_conflict_pMIC={n_canon_conflict}  unique={len(out)}")
 
     out[smiles_col] = out["_canonical"]
     out = out.drop(columns=["_canonical"])
@@ -98,7 +120,7 @@ def canonicalize_and_dedup(df, smiles_col="SMILES", pmic_col="pMIC", label="Data
 
 
 def load_labeled_smiles_table(path, label=None):
-    """Read a SMILES + pMIC table, canonicalize, and mean-aggregate duplicates."""
+    """Read a SMILES + pMIC table, canonicalize, and median-aggregate duplicates."""
     path = Path(path)
     ext = path.suffix.lower()
     df = pd.read_excel(path) if ext in (".xlsx", ".xls") else pd.read_csv(path)
@@ -110,7 +132,192 @@ def load_labeled_smiles_table(path, label=None):
         raise ValueError(f"{path.name} must have a pMIC column")
     df = df.rename(columns={col_map["smiles"]: "SMILES", col_map["pmic"]: "pMIC"})
     df = df.dropna(subset=["SMILES", "pMIC"]).reset_index(drop=True)
-    return canonicalize_and_dedup(df, label=label or path.name)
+    return canonicalize_and_dedup(df, label=label or path.name, pmic_agg="median")
+
+
+def plot_pmic_distribution(y, out_path, cutoff=6.0, label="modeling set"):
+    """Bar plot of pMIC (0.5-wide bins) + Active/Inactive counts, before the split."""
+    y = np.asarray(y, dtype=float)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(y)
+    n_act = int((y >= cutoff).sum())
+    n_inact = n - n_act
+    frac = (n_act / n) if n else 0.0
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle(f"pMIC distribution (before train/test split) — {label}",
+                 fontweight="bold")
+
+    lo = np.floor(y.min() * 2.0) / 2.0
+    hi = np.ceil(y.max() * 2.0) / 2.0
+    edges = np.arange(lo, hi + 0.25, 0.5)
+    counts, edges = np.histogram(y, bins=edges)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    colors = ["#2ecc71" if c >= cutoff else "#e74c3c" for c in centers]
+    axes[0].bar(centers, counts, width=0.45, color=colors, edgecolor="white")
+    axes[0].axvline(cutoff, color="black", lw=1.8, ls="--",
+                    label=f"cutoff = {cutoff:g}")
+    axes[0].set_xlabel("pMIC")
+    axes[0].set_ylabel("Count")
+    axes[0].set_title("Binned pMIC")
+    axes[0].legend()
+    axes[0].grid(axis="y", alpha=0.3)
+
+    bars = axes[1].bar(
+        [f"Inactive\n(pMIC < {cutoff:g})", f"Active\n(pMIC ≥ {cutoff:g})"],
+        [n_inact, n_act], color=["#e74c3c", "#2ecc71"],
+        edgecolor="white", width=0.55)
+    for bar, v in zip(bars, [n_inact, n_act]):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                     f"{v}\n({v / n * 100:.1f}%)", ha="center", va="bottom")
+    axes[1].set_ylabel("Count")
+    axes[1].set_title(f"Class balance at cutoff {cutoff:g}")
+    axes[1].set_ylim(0, max(n_inact, n_act) * 1.28)
+    axes[1].grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] {out_path.name}  n={n}  active@{cutoff:g}={n_act} ({frac * 100:.1f}%)")
+    return dict(n=n, n_active=n_act, n_inactive=n_inact, active_frac=frac, cutoff=cutoff)
+
+
+def report_canonical_overlap(smiles_a, smiles_b, name_a, name_b):
+    """Print |A ∩ B| on canonical SMILES (already-deduped strings)."""
+    a = set(map(str, smiles_a))
+    b = set(map(str, smiles_b))
+    inter = a & b
+    den = max(len(b), 1)
+    print(f"[Overlap] {name_a} ∩ {name_b}: {len(inter)}  "
+          f"({len(inter) / den * 100:.1f}% of {name_b}; "
+          f"|{name_a}|={len(a)}  |{name_b}|={len(b)})")
+    return inter
+
+
+def run_sensitivity_analysis(
+    files,
+    train_smiles,
+    modeling_smiles,
+    smiles_to_features_fn,
+    reg_model, reg_transform,
+    cls_model, cls_transform,
+    pmic_threshold,
+    decision_threshold,
+    out_dir="plots",
+):
+    """
+    Apply the frozen AllStrainsExceptResistant models to other labeled sets.
+    Report metrics on all molecules, modeling-set overlap, and held-out-only.
+    """
+    train_set = set(map(str, train_smiles))
+    model_set = set(map(str, modeling_smiles))
+    rows = []
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "═" * 60)
+    print("  SENSITIVITY ANALYSIS  (frozen main model)")
+    print(f"  pMIC cutoff={pmic_threshold:g}  |  decision threshold={decision_threshold:.3f}")
+    print("═" * 60)
+
+    for f in files:
+        path = Path(f)
+        if not path.exists():
+            print(f"[Sensitivity] {path} not found — skip")
+            continue
+        df = load_labeled_smiles_table(path, label=path.stem)
+        X, ok, _ = smiles_to_features_fn(df["SMILES"].tolist())
+        dfv = df.iloc[ok].reset_index(drop=True)
+        y = dfv["pMIC"].values
+        smi = dfv["SMILES"].astype(str).tolist()
+        y_hat = reg_model.predict(reg_transform(X))
+        proba = cls_model.predict_proba(cls_transform(X))[:, 1]
+        y_bin = (y >= pmic_threshold).astype(int)
+        y_pred = (proba >= decision_threshold).astype(int)
+        in_model = np.array([s in model_set for s in smi])
+        in_train = np.array([s in train_set for s in smi])
+
+        def _pack(mask, subset):
+            n_m = int(mask.sum())
+            if n_m < 2:
+                print(f"  [{path.stem}/{subset}] n={n_m} — skip metrics")
+                return None
+            ym, yh = y[mask], y_hat[mask]
+            yb, yp, pr = y_bin[mask], y_pred[mask], proba[mask]
+            rec = dict(
+                dataset=path.stem, subset=subset, n=n_m,
+                n_active=int(yb.sum()),
+                overlap_with_modeling=int(in_model[mask].sum()),
+                overlap_with_train=int(in_train[mask].sum()),
+                R2=float(r2_score(ym, yh)),
+                RMSE=float(np.sqrt(mean_squared_error(ym, yh))),
+                MAE=float(mean_absolute_error(ym, yh)),
+                Accuracy=float(accuracy_score(yb, yp)),
+                Bal_Acc=float(balanced_accuracy_score(yb, yp)),
+                F1=float(f1_score(yb, yp, zero_division=0)),
+                MCC=float(matthews_corrcoef(yb, yp)),
+            )
+            try:
+                rec["ROC_AUC"] = float(roc_auc_score(yb, pr)) if len(np.unique(yb)) > 1 else np.nan
+            except ValueError:
+                rec["ROC_AUC"] = np.nan
+            try:
+                rec["AP"] = float(average_precision_score(yb, pr)) if len(np.unique(yb)) > 1 else np.nan
+            except ValueError:
+                rec["AP"] = np.nan
+            return rec
+
+        for mask, subset in [
+            (np.ones(len(dfv), dtype=bool), "all"),
+            (in_model, "overlap_modeling"),
+            (~in_model, "heldout_vs_modeling"),
+            (in_train, "overlap_train"),
+            (~in_train, "heldout_vs_train"),
+        ]:
+            rec = _pack(mask, subset)
+            if rec is None:
+                continue
+            rows.append(rec)
+            print(f"  [{path.stem}/{subset}] n={rec['n']}  "
+                  f"R²={rec['R2']:.3f}  RMSE={rec['RMSE']:.3f}  "
+                  f"AUC={rec['ROC_AUC']:.3f}  AP={rec['AP']:.3f}  "
+                  f"F1={rec['F1']:.3f}")
+
+        out = dfv.copy()
+        out["pMIC_predicted"] = np.round(y_hat, 4)
+        out["Active_probability"] = np.round(proba, 4)
+        out["Active_predicted"] = y_pred
+        out["Active_experimental"] = y_bin
+        out["in_modeling_set"] = in_model.astype(int)
+        out["in_train_set"] = in_train.astype(int)
+        out_xlsx = Path(f"sensitivity_{path.stem}_predictions.xlsx")
+        out.to_excel(out_xlsx, index=False)
+        print(f"  [saved] {out_xlsx}")
+
+        fig, ax = plt.subplots(figsize=(6.8, 5.6))
+        ax.scatter(y[~in_model], y_hat[~in_model], s=16, alpha=0.5, c="#2196F3",
+                   label=f"held-out n={int((~in_model).sum())}", edgecolors="none")
+        ax.scatter(y[in_model], y_hat[in_model], s=16, alpha=0.45, c="#FF9800",
+                   label=f"overlap n={int(in_model.sum())}", edgecolors="none")
+        lims = [min(y.min(), y_hat.min()) - 0.3, max(y.max(), y_hat.max()) + 0.3]
+        ax.plot(lims, lims, "k--", lw=1.2)
+        ax.set_xlim(lims)
+        ax.set_ylim(lims)
+        ax.set_xlabel("Experimental pMIC")
+        ax.set_ylabel("Predicted pMIC")
+        ax.set_title(f"Sensitivity — {path.stem} (frozen main model)", fontweight="bold")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        fig_path = out_dir / f"sens_{path.stem}_pred_vs_exp.png"
+        fig.savefig(fig_path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [saved] {fig_path.name}")
+
+    if rows:
+        pd.DataFrame(rows).to_csv("sensitivity_analysis_metrics.csv", index=False)
+        print("  [saved] sensitivity_analysis_metrics.csv")
+    return rows
 
 
 # ── Butina / scaffold split ───────────────────────────────────────────────────
@@ -266,13 +473,17 @@ def compare_pmic_thresholds(X_tr, y_pmic_tr, groups_tr, thresholds=(5.5, 6.0),
             auc = roc_auc_score(y, proba)
         except ValueError:
             auc = np.nan
+        try:
+            ap = average_precision_score(y, proba)
+        except ValueError:
+            ap = np.nan
         bal = balanced_accuracy_score(y, pred)
         f1 = f1_score(y, pred, zero_division=0)
         mcc = matthews_corrcoef(y, pred)
         usable = frac >= 0.05 and not np.isnan(auc)
-        print(f"  T={T:.1f}: active={frac*100:5.1f}%  AUC={auc:.4f}  "
+        print(f"  T={T:.1f}: active={frac*100:5.1f}%  AUC={auc:.4f}  AP={ap:.4f}  "
               f"BalAcc={bal:.4f}  F1={f1:.4f}  MCC={mcc:.4f}")
-        rows.append(dict(threshold=T, active_frac=frac, cv_auc=auc,
+        rows.append(dict(threshold=T, active_frac=frac, cv_auc=auc, cv_ap=ap,
                          cv_bal_acc=bal, cv_f1=f1, cv_mcc=mcc, usable=usable))
 
     res = pd.DataFrame(rows)
@@ -405,35 +616,40 @@ def atoms_for_maccs_bit(mol, bit):
     return atoms
 
 
-def highlight_molecule(mol, fp_feats, out_path, title="", radius=2, n_bits=2048):
+def highlight_molecule(mol, fp_feats, out_path, title="", radius=2, n_bits=2048,
+                       signed=False):
     """
-    fp_feats: list of (feat_name, kind, bit, importance)
-    Color morgan bits warm, maccs cool; draw to PNG.
+    fp_feats: list of (feat_name, kind, bit, importance[, shap_signed])
+    If signed, green = positive SHAP (increases prediction), red = negative.
+    Else morgan=orange, maccs=blue (unsigned overlay).
     """
     if mol is None:
         return False
     atom_colors = {}
     highlight_atoms = set()
-    for feat_name, kind, bit, imp in fp_feats:
+    for item in fp_feats:
+        feat_name, kind, bit, imp = item[:4]
+        shap_s = item[4] if (signed and len(item) > 4) else None
         if kind == "morgan":
             atoms = atoms_for_morgan_bit(mol, bit, radius=radius, n_bits=n_bits)
-            color = (1.0, 0.6, 0.2)  # orange
         else:
             atoms = atoms_for_maccs_bit(mol, bit)
-            color = (0.3, 0.55, 0.95)  # blue
+        if shap_s is None:
+            color = (1.0, 0.6, 0.2) if kind == "morgan" else (0.3, 0.55, 0.95)
+        else:
+            color = (0.12, 0.62, 0.28) if shap_s >= 0 else (0.82, 0.18, 0.18)
         for a in atoms:
             highlight_atoms.add(a)
-            # stronger importance -> keep color (last wins is fine)
             atom_colors[a] = color
 
     drawer = rdMolDraw2D.MolDraw2DCairo(700, 500)
     opts = drawer.drawOptions()
-    opts.legendFontSize = 18
+    opts.legendFontSize = 16
     rdMolDraw2D.PrepareAndDrawMolecule(
         drawer, mol,
         highlightAtoms=list(highlight_atoms),
         highlightAtomColors=atom_colors,
-        legend=title[:80],
+        legend=title[:90],
     )
     drawer.FinishDrawing()
     out_path = Path(out_path)
@@ -443,29 +659,57 @@ def highlight_molecule(mol, fp_feats, out_path, title="", radius=2, n_bits=2048)
     return True
 
 
+def _signed_fp_bits_for_row(shap_row, feat_names, top_k=8):
+    """Top-k morgan/maccs bits by |SHAP| on one molecule, with sign."""
+    abs_s = np.abs(shap_row)
+    order = np.argsort(abs_s)[::-1]
+    out = []
+    for i in order:
+        parsed = _parse_fp_feature(feat_names[i])
+        if parsed is None:
+            continue
+        kind, bit = parsed
+        sv = float(shap_row[i])
+        out.append((feat_names[i], kind, bit, abs(sv), sv))
+        if len(out) >= top_k:
+            break
+    return out
+
+
 def highlight_top_test_and_mapping(
     smiles_test, y_pred_test, y_true_test,
     shap_values, feat_names_shap,
     mapping_xlsx="SMILES for mapping.xlsx",
     out_dir="plots/fp_highlights",
     top_n_mols=5,
-    top_n_feats=12,
+    top_n_feats=8,
     n_bits=2048,
     score_name="score",
+    shap_model=None,
+    X_test_f=None,
 ):
-    """Highlight top SHAP morgan/maccs bits on top-N scored test mols + TB drugs."""
+    """
+    Overlay + per-bit drawings. If shap_model and X_test_f are given, each bit is
+    colored by that molecule's signed SHAP (green +, red −).
+    """
+    import shap as _shap
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    fp_feats = top_fp_features_from_shap(shap_values, feat_names_shap, top_k=top_n_feats)
+    fp_feats = top_fp_features_from_shap(shap_values, feat_names_shap, top_k=max(top_n_feats, 12))
     if not fp_feats:
         print("[Highlight] No morgan/maccs features in top SHAP - skip")
         return fp_feats
     print(f"[Highlight] Top FP features: {[f[0] for f in fp_feats[:8]]} ...")
 
-    # catalog
     pd.DataFrame(fp_feats, columns=["feature", "kind", "bit", "mean_abs_shap"]).to_csv(
         out_dir / "top_fp_shap_features.csv", index=False)
 
+    explainer = None
+    if shap_model is not None and X_test_f is not None:
+        explainer = _shap.TreeExplainer(shap_model)
+
+    rows_log = []
     order = np.argsort(y_pred_test)[::-1][:top_n_mols]
     for rank, i in enumerate(order, 1):
         smi = smiles_test[i]
@@ -474,10 +718,36 @@ def highlight_top_test_and_mapping(
                  f"exp_pMIC={y_true_test[i]:.2f}")
         safe_score = f"{y_pred_test[i]:.2f}".replace(".", "p")
         path = out_dir / f"test_top{rank}_{score_name}_{safe_score}.png"
-        ok = highlight_molecule(mol, fp_feats, path, title=title, n_bits=n_bits)
-        print(f"  [{'ok' if ok else 'fail'}] {path.name}")
 
-    # mapping file: Name | SMILES (no header)
+        signed_feats = fp_feats
+        if explainer is not None:
+            sv = explainer.shap_values(X_test_f[i:i + 1])
+            if isinstance(sv, list):
+                sv = sv[1]
+            sv = np.asarray(sv)
+            if sv.ndim == 3:
+                sv = sv[:, :, 1]
+            row = sv[0]
+            signed_feats = _signed_fp_bits_for_row(row, feat_names_shap, top_k=top_n_feats)
+
+        ok = highlight_molecule(mol, signed_feats, path, title=title, n_bits=n_bits,
+                                signed=explainer is not None)
+        print(f"  [{'ok' if ok else 'fail'}] overlay {path.name}")
+
+        bit_dir = out_dir / f"test_top{rank}_bits"
+        bit_dir.mkdir(parents=True, exist_ok=True)
+        for k, item in enumerate(signed_feats, 1):
+            name, kind, bit, mag, *rest = item
+            sv = rest[0] if rest else mag
+            sign = "pos" if sv >= 0 else "neg"
+            contrib = "increases prediction" if sv >= 0 else "decreases prediction"
+            bit_title = f"{name}  SHAP={sv:+.4f}  ({sign}, {contrib})"
+            bpath = bit_dir / f"{k:02d}_{name}_{sign}.png"
+            highlight_molecule(mol, [item if len(item) == 5 else (*item, sv)],
+                               bpath, title=bit_title, n_bits=n_bits, signed=True)
+            rows_log.append(dict(mol=f"test_top{rank}", feature=name, kind=kind, bit=bit,
+                                 shap=sv, contribution=sign, file=str(bpath.name)))
+
     map_path = Path(mapping_xlsx)
     if map_path.exists():
         mdf = pd.read_excel(map_path, header=None, names=["Name", "SMILES"])
@@ -488,9 +758,16 @@ def highlight_top_test_and_mapping(
             safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
             path = out_dir / f"map_{safe}.png"
             ok = highlight_molecule(mol, fp_feats, path, title=name, n_bits=n_bits)
-            print(f"  [{'ok' if ok else 'fail'}] mapping {name} -> {path.name}")
+            print(f"  [{'ok' if ok else 'fail'}] mapping overlay {name}")
+            if explainer is None or mol is None:
+                continue
+            # Per-bit for mapping drugs needs features; skip unless we featurize.
     else:
         print(f"[Highlight] mapping file not found: {mapping_xlsx}")
+
+    if rows_log:
+        pd.DataFrame(rows_log).to_csv(out_dir / "per_bit_signed_shap.csv", index=False)
+        print(f"  [saved] {out_dir / 'per_bit_signed_shap.csv'}")
     return fp_feats
 
 
@@ -501,6 +778,8 @@ def run_external_validation(
     smiles_to_features_fn, pmic_threshold,
     path="Cleaned_External_Validation.xlsx",
     out_dir="plots",
+    decision_threshold=0.5,
+    modeling_smiles=None,
 ):
     """Predict on labeled external set; report regression + classification metrics."""
     path = Path(path)
@@ -511,8 +790,13 @@ def run_external_validation(
 
     print("\n" + "═" * 60)
     print(f"  EXTERNAL VALIDATION  ← {path.name}")
+    print(f"  decision threshold (frozen OOF) = {decision_threshold:.3f}")
     print("═" * 60)
     df = load_labeled_smiles_table(path)
+
+    if modeling_smiles is not None:
+        report_canonical_overlap(
+            modeling_smiles, df["SMILES"].tolist(), "modeling", "External")
 
     X, valid_idx, _ = smiles_to_features_fn(df["SMILES"].tolist())
     dfv = df.iloc[valid_idx].reset_index(drop=True)
@@ -522,7 +806,7 @@ def run_external_validation(
     y_hat = reg_model.predict(reg_transform(X))
     proba = cls_model.predict_proba(cls_transform(X))[:, 1]
     y_bin = (y >= pmic_threshold).astype(int)
-    y_pred = (proba >= 0.5).astype(int)
+    y_pred = (proba >= float(decision_threshold)).astype(int)
 
     reg_m = {
         "R2": r2_score(y, y_hat),
@@ -537,12 +821,43 @@ def run_external_validation(
     }
     if len(np.unique(y_bin)) > 1:
         cls_m["ROC_AUC"] = roc_auc_score(y_bin, proba)
+        cls_m["AP"] = average_precision_score(y_bin, proba)
     else:
         cls_m["ROC_AUC"] = float("nan")
+        cls_m["AP"] = float("nan")
 
     print("  Regression:", {k: round(v, 4) for k, v in reg_m.items()})
     print("  Classification:", {k: round(v, 4) if isinstance(v, float) else v
                                 for k, v in cls_m.items()})
+
+    if modeling_smiles is not None:
+        model_set = set(map(str, modeling_smiles))
+        held = ~dfv["SMILES"].astype(str).isin(model_set)
+        n_held = int(held.sum())
+        n_ov = int((~held).sum())
+        if n_ov:
+            print(f"  [Overlap] {n_ov} External molecules are in the modeling set; "
+                  f"{n_held} are held-out")
+        if n_held >= 5 and n_ov:
+            yh, yhat = y[held], y_hat[held]
+            yb, yp, pr = y_bin[held], y_pred[held], proba[held]
+            print("  Held-out-only regression:",
+                  {k: round(v, 4) for k, v in dict(
+                      R2=float(r2_score(yh, yhat)),
+                      RMSE=float(np.sqrt(mean_squared_error(yh, yhat))),
+                      MAE=float(mean_absolute_error(yh, yhat)),
+                  ).items()})
+            ho_cls = dict(
+                Accuracy=float(accuracy_score(yb, yp)),
+                Bal_Acc=float(balanced_accuracy_score(yb, yp)),
+                F1=float(f1_score(yb, yp, zero_division=0)),
+                MCC=float(matthews_corrcoef(yb, yp)),
+            )
+            if len(np.unique(yb)) > 1:
+                ho_cls["ROC_AUC"] = float(roc_auc_score(yb, pr))
+                ho_cls["AP"] = float(average_precision_score(yb, pr))
+            print("  Held-out-only classification:",
+                  {k: round(v, 4) for k, v in ho_cls.items()})
 
     out = dfv.copy()
     out["pMIC_predicted"] = np.round(y_hat, 4)
@@ -583,6 +898,7 @@ def run_external_validation(
 
     pd.DataFrame([{**{f"reg_{k}": v for k, v in reg_m.items()},
                    **{f"cls_{k}": v for k, v in cls_m.items()},
-                   "threshold": pmic_threshold,
+                   "pmic_threshold": pmic_threshold,
+                   "decision_threshold": decision_threshold,
                    "n": len(dfv)}]).to_csv("external_validation_metrics.csv", index=False)
     return {"reg": reg_m, "cls": cls_m, "df": out}

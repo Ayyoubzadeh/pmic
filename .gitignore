@@ -1,7 +1,3 @@
-# Existing data dumps
-coconut_csv-07-2026.xlsx
-predictions_coconut.csv
-
 # Python bytecode
 __pycache__/
 *.py[cod]
@@ -15,6 +11,21 @@ __pycache__/
 *.zip
 *.7z
 
-# Large datasets
+# Datasets and Excel outputs (keep mapping table)
+*.xlsx
+!SMILES for mapping.xlsx
+
+# Generated Word reports (embedded figures)
+*.docx
+
+# Run logs
+*.log
+
+# Generated figures
+plots/
+
+# Coconut dumps
+coconut_csv-07-2026.xlsx
+predictions_coconut.csv
 coconut_csv-07-2026_pmic.csv
 other/*.xlsx
